@@ -110,6 +110,17 @@
     padding:2px 7px; border-radius:999px; border:1px solid var(--marker-soft); color:var(--marker);
   }
 
+  .resume{
+    display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+    padding:8px 10px 8px 12px; border-radius:var(--r);
+    background:color-mix(in srgb, var(--marker) 12%, var(--surface));
+    border:1px solid var(--marker-soft);
+  }
+  .resume .rdot{width:8px;height:8px;border-radius:50%;background:var(--marker);flex:0 0 auto;}
+  .resume .rtxt{font-size:13px; flex:1 1 160px; min-width:0;}
+  .resume .rtxt b{font-weight:600;}
+  .resume .rbtn{min-height:34px; padding:0 11px; font-size:13.5px;}
+
   /* ---- waveform ---- */
   .stage{
     position:relative; background:var(--surface); border:1px solid var(--line);
@@ -122,6 +133,12 @@
     background:color-mix(in srgb, var(--surface) 85%, transparent); padding:2px 7px; border-radius:6px;
     pointer-events:none;
   }
+  .ovwrap{
+    position:relative; height:46px; flex:0 0 auto;
+    background:var(--surface); border:1px solid var(--line); border-radius:var(--r);
+    overflow:hidden; box-shadow:var(--shadow);
+  }
+  .ovwrap canvas{touch-action:none; cursor:grab;}
   .busy{
     position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
     background:color-mix(in srgb, var(--surface) 88%, transparent); font-weight:500; gap:10px;
@@ -215,11 +232,20 @@
 
   <div class="meta" id="meta"></div>
 
+  <div class="resume" id="resume" hidden>
+    <span class="rdot"></span>
+    <span class="rtxt" id="resumeTxt"></span>
+    <label class="btn ghost rbtn" for="pick">Abrir ficheiro</label>
+    <button class="btn ghost rbtn" id="resumeX" aria-label="Dispensar">✕</button>
+  </div>
+
   <section class="stage">
     <canvas id="cv"></canvas>
-    <div class="hint" id="hint">Toca para posicionar &middot; arrasta para deslocar</div>
+    <div class="hint" id="hint">Toca para posicionar &middot; arrasta &middot; pinça ou duplo toque para zoom</div>
     <div class="busy" id="busy" hidden><span class="spin"></span><span id="busyTxt">A ler o ficheiro…</span></div>
   </section>
+
+  <div class="ovwrap"><canvas id="ov"></canvas></div>
 
   <div class="transport">
     <button class="btn icon" id="prev" title="Marca anterior" aria-label="Marca anterior">⏮</button>
@@ -249,7 +275,7 @@
 (function(){
   "use strict";
 
-  var VERSION = '6';
+  var VERSION = '8';
 
   // ---------------------------------------------------------------- helpers
   var $ = function(id){ return document.getElementById(id); };
@@ -288,7 +314,7 @@
     $('busy').hidden = !on;
     if(txt) $('busyTxt').textContent = txt;
   }
-  var HINT = 'Toca para posicionar · arrasta para deslocar';
+  var HINT = 'Toca para posicionar · arrasta · pinça ou duplo toque para zoom';
   function hint(txt){ $('hint').textContent = txt || HINT; }
 
   // ---------------------------------------------------------------- state
@@ -301,6 +327,7 @@
     file: null,
     wav: null,          // info dos chunks quando é WAV PCM/float
     peaks: null,        // {pk:Float32Array, n, fpb, filled}
+    detail: null,       // amostras reais da janela visível, quando se aproxima
     markers: [],
     view: {a:0, b:1},
     loop: false,
@@ -384,6 +411,7 @@
   function seek(t){
     t = Math.max(0, Math.min(state.dur || 0, t));
     setSource(t, isPlaying() || wantPlay);
+    save();
   }
   function syncPlayBtn(){
     var b = $('play');
@@ -631,6 +659,16 @@
 
   var _pr = [0, 0];
   function peakAt(t0, t1){
+    var d = state.detail;
+    if(d && t0 >= d.a && t1 <= d.b){
+      var db0 = Math.floor((t0*d.sr - d.f0)/d.fpb), db1 = Math.ceil((t1*d.sr - d.f0)/d.fpb);
+      if(db1 <= db0) db1 = db0 + 1;
+      db0 = Math.max(0, Math.min(d.n-1, db0)); db1 = Math.max(db0+1, Math.min(d.n, db1));
+      var dm = 0, dr = 0;
+      for(var q=db0;q<db1;q++){ if(d.pk[q] > dm) dm = d.pk[q]; if(d.rms[q] > dr) dr = d.rms[q]; }
+      _pr[0] = dm; _pr[1] = dr;
+      return _pr;
+    }
     var p = state.peaks;
     _pr[0] = 0; _pr[1] = 0;
     if(!p || !p.sr || !p.filled) return _pr;
@@ -744,30 +782,85 @@
     $('tNow').textContent = fmt(ht);
     $('tDur').textContent = '/ ' + fmt(state.dur);
     highlightRow();
+    drawOverview();
   }
 
-  // ---------------------------------------------------------------- view
-  function fitView(){ state.view.a = 0; state.view.b = Math.max(0.001, state.dur); draw(); }
-  function zoom(factor, anchorT){
-    if(!state.dur) return;
-    var a = state.view.a, b = state.view.b, span = b - a;
-    var at = anchorT == null ? headTime() : anchorT;
-    if(at < a || at > b) at = a + span/2;
-    var ns = Math.max(0.05, Math.min(state.dur, span*factor));
-    var frac = span > 0 ? (at - a)/span : .5;
-    var na = at - ns*frac, nb = na + ns;
-    if(na < 0){ na = 0; nb = ns; }
-    if(nb > state.dur){ nb = state.dur; na = Math.max(0, nb - ns); }
-    state.view.a = na; state.view.b = nb;
-    draw();
+  // ---------------------------------------------------------------- vista: zoom e deslocamento
+  var MIN_SPAN = 0.05;          // 50 ms é o máximo de aproximação
+  var followPause = 0;          // enquanto toca, a vista segue o cursor; um gesto teu suspende isso
+
+  function clampView(a, span){
+    var total = state.dur || 1;
+    span = Math.max(MIN_SPAN, Math.min(total, span));
+    if(span >= total) return { a:0, b:total };
+    if(a < 0) a = 0;
+    if(a + span > total) a = total - span;
+    return { a:a, b:a+span };
   }
+  function setView(a, span, byUser){
+    var v = clampView(a, span);
+    state.view.a = v.a; state.view.b = v.b;
+    if(byUser) followPause = Date.now() + 6000;
+    scheduleDetail();
+    draw(); save();
+  }
+  function fitView(){ setView(0, state.dur || 1, false); }
+  function zoomAt(factor, anchorT, byUser){
+    if(!state.dur) return;
+    var a = state.view.a, span = state.view.b - a;
+    var at = anchorT == null ? headTime() : anchorT;
+    if(at < a || at > a + span) at = a + span/2;
+    var frac = span > 0 ? (at - a)/span : .5;
+    var ns = Math.max(MIN_SPAN, Math.min(state.dur, span*factor));
+    setView(at - ns*frac, ns, byUser);
+  }
+  function zoom(factor, anchorT){ zoomAt(factor, anchorT, true); }
   function ensureVisible(t){
-    var a = state.view.a, b = state.view.b, span = b - a;
-    if(span >= state.dur - 1e-6) return;
-    if(t < a + span*0.08 || t > b - span*0.08){
-      var na = Math.max(0, Math.min(state.dur - span, t - span/2));
-      state.view.a = na; state.view.b = na + span;
+    var a = state.view.a, span = state.view.b - a;
+    if(span >= (state.dur || 0) - 1e-6) return;
+    if(t < a + span*0.08 || t > a + span*0.92){
+      setView(t - span/2, span, false);
     }
+  }
+
+  // ---------------------------------------------------------------- detalhe: ao aproximar, lê as amostras reais da janela
+  var detailTimer = 0;
+  function scheduleDetail(){
+    clearTimeout(detailTimer);
+    detailTimer = setTimeout(loadDetail, 180);
+  }
+  function loadDetail(){
+    var info = state.wav, p = state.peaks;
+    if(!info || !p || !state.file || !state.dur){ state.detail = null; return; }
+    var w = cv.clientWidth || 1;
+    var span = state.view.b - state.view.a;
+    var framesPerPx = (span * info.sr) / w;
+    if(framesPerPx >= p.fpb){ state.detail = null; draw(); return; }   // o mipmap já chega
+    var d = state.detail;
+    if(d && state.view.a >= d.a && state.view.b <= d.b && d.framesPerPx <= framesPerPx * 1.6) return;
+
+    var frameSize = (info.bits >> 3) * info.channels;
+    var pad = span * 0.6;
+    var t0 = Math.max(0, state.view.a - pad), t1 = Math.min(state.dur, state.view.b + pad);
+    var f0 = Math.floor(t0 * info.sr), f1 = Math.ceil(t1 * info.sr);
+    var MAXB = 12 * 1024 * 1024;
+    if((f1 - f0) * frameSize > MAXB) f1 = f0 + Math.floor(MAXB / frameSize);
+    var byteA = info.dataOffset + f0 * frameSize;
+    var byteB = Math.min(info.dataOffset + info.dataSize, info.dataOffset + f1 * frameSize);
+    if(byteB <= byteA) return;
+
+    var frames = Math.floor((byteB - byteA) / frameSize);
+    var fpb = Math.max(1, Math.floor(framesPerPx / 2));
+    var n = Math.ceil(frames / fpb);
+    var token = state.scanToken;
+    slice(state.file, byteA, byteB).then(function(buf){
+      if(token !== state.scanToken) return;
+      var pk = new Float32Array(n), rms = new Float32Array(n);
+      fillBuckets(buf, info, pk, rms, 0, n, fpb, frameSize, 1, frames);
+      state.detail = { a: f0/info.sr, b: (f0+frames)/info.sr, pk:pk, rms:rms, n:n, fpb:fpb,
+                       sr: info.sr, f0: f0, framesPerPx: framesPerPx };
+      draw();
+    })['catch'](function(){});
   }
 
   // ---------------------------------------------------------------- markers
@@ -900,28 +993,64 @@
   }
 
   // ---------------------------------------------------------------- storage
-  function storeKey(){
-    if(state.isDemo || !state.dur) return null;
-    return 'mwav:' + state.name + ':' + Math.round(state.dur*1000);
+  function fileKey(){
+    if(state.isDemo || !state.name || !state.size) return null;
+    return 'mwav:f:' + state.name + ':' + state.size;
   }
+  var saveTimer = 0;
   function save(){
-    var k = storeKey(); if(!k) return;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(saveNow, 700);
+  }
+  function saveNow(){
+    var k = fileKey(); if(!k) return;
     try{
-      localStorage.setItem(k, JSON.stringify(state.markers.map(function(m){
-        return { t:m.t, end:m.end, name:m.name };
-      })));
+      var data = {
+        name: state.name, size: state.size, dur: state.dur,
+        head: headTime(), loop: state.loop,
+        view: { a: state.view.a, b: state.view.b },
+        markers: state.markers.map(function(m){ return { t:m.t, end:m.end, name:m.name }; }),
+        at: Date.now()
+      };
+      localStorage.setItem(k, JSON.stringify(data));
+      localStorage.setItem('mwav:last', k);
     }catch(e){}
   }
-  function load(){
-    var k = storeKey(); if(!k) return null;
+  function readSession(k){
+    if(!k) return null;
     try{
       var raw = localStorage.getItem(k);
       if(!raw) return null;
-      var arr = JSON.parse(raw);
-      if(!Array.isArray(arr) || !arr.length) return null;
-      return arr.map(function(m){ return { id: uid++, t:+m.t, end: m.end == null ? null : +m.end, name: String(m.name||'') }; });
+      var d = JSON.parse(raw);
+      if(!d || !d.name) return null;
+      d.markers = (d.markers || []).map(function(m){
+        return { id: uid++, t:+m.t, end: m.end == null ? null : +m.end, name: String(m.name||'') };
+      });
+      return d;
     }catch(e){ return null; }
   }
+  window.addEventListener('pagehide', saveNow);
+  document.addEventListener('visibilitychange', function(){ if(document.hidden) saveNow(); });
+
+  // barra "retomar" com a última sessão, enquanto ainda não há ficheiro aberto
+  function showResume(){
+    var bar = $('resume');
+    var k = null;
+    try{ k = localStorage.getItem('mwav:last'); }catch(e){}
+    var d = readSession(k);
+    if(!d || !state.isDemo){ bar.hidden = true; return; }
+    $('resumeTxt').innerHTML = 'Última sessão: <b></b> — <span></span>';
+    $('resumeTxt').querySelector('b').textContent = d.name;
+    var pieces = [];
+    if(d.head > 1) pieces.push('parado em ' + fmt(d.head));
+    if(d.markers.length) pieces.push(d.markers.length + (d.markers.length === 1 ? ' marca' : ' marcas'));
+    $('resumeTxt').querySelector('span').textContent = pieces.join(' · ') || 'sem marcas';
+    bar.hidden = false;
+  }
+  $('resumeX').addEventListener('click', function(){
+    $('resume').hidden = true;
+    try{ localStorage.removeItem('mwav:last'); }catch(e){}
+  });
 
   // ---------------------------------------------------------------- meta
   function renderMeta(){
@@ -953,7 +1082,7 @@
     state.file = file; state.wav = null;
     state.name = file.name; state.isDemo = !!isDemo; state.size = file.size;
     state.sr = null; state.bits = null; state.channels = null;
-    state.peaks = null; state.dur = 0; state.markers = []; anchor = 0; wantPlay = false;
+    state.peaks = null; state.detail = null; state.dur = 0; state.markers = []; anchor = 0; wantPlay = false;
     renderMeta(); renderList(); hint(); draw();
     busy(true, 'A abrir ' + mb(file.size) + '…');
 
@@ -982,14 +1111,33 @@
                           name: info.labels[q.id] || ('Cue ' + (i+1)) });
         });
       }
-      var saved = load();
-      if(saved){ state.markers = saved; toast('Marcas guardadas neste dispositivo restauradas (' + saved.length + ').'); }
-      else {
+      var sess = readSession(fileKey());
+      var resumed = false;
+      if(sess && (sess.markers.length || sess.head > 1)){
+        state.markers = sess.markers.length ? sess.markers : embedded;
+        state.loop = !!sess.loop;
+        $('loop').setAttribute('aria-pressed', state.loop ? 'true' : 'false');
+        resumed = true;
+      } else {
         state.markers = embedded;
         if(embedded.length) toast(embedded.length + ' marca' + (embedded.length>1?'s':'') + ' lida' + (embedded.length>1?'s':'') + ' do ficheiro.');
         else if(!isDemo) toast('Ficheiro aberto. Não traz cues embebidos — importa o CSV ou usa "+ Marca".', 5000);
       }
       sortMarkers(); renderMeta(); renderList(); fitView(); syncPlayBtn();
+      $('resume').hidden = true;
+
+      if(resumed){
+        if(sess.view && sess.view.b > sess.view.a && sess.view.b <= state.dur + 0.01){
+          state.view.a = sess.view.a; state.view.b = sess.view.b;
+        }
+        if(sess.head > 0.5 && sess.head < state.dur - 0.2) setSource(sess.head, false);
+        var bits2 = [];
+        if(sess.head > 1) bits2.push('em ' + fmt(sess.head));
+        if(state.markers.length) bits2.push(state.markers.length + (state.markers.length === 1 ? ' marca' : ' marcas'));
+        toast('Sessão retomada — ' + bits2.join(', ') + '.', 5000);
+        draw();
+      }
+      saveNow();
 
       if(info) buildPeaksFromFile(file, info, token);
       else buildPeaksFromDecoded(file, token);
@@ -1096,51 +1244,183 @@
     catch(e){ blob.name = 'Exemplo — alinhamento de show.wav'; return blob; }
   }
 
-  // ---------------------------------------------------------------- pointer
-  var drag = null;
+  // ---------------------------------------------------------------- gestos: arrastar, pinça, duplo toque
+  var ov = $('ov'), go = ov.getContext('2d');
+  var pts = {};              // pointerId -> x
+  var gest = null;           // {mode, ...}
+  var vel = 0, lastMoveAt = 0, inertiaRaf = 0;
+  var lastTap = 0, lastTapX = 0;
+
   function timeAtX(x){
     var w = cv.clientWidth || 1;
     return state.view.a + (x/w)*(state.view.b - state.view.a);
   }
+  function ids(){ var k = []; for(var i in pts) k.push(i); return k; }
+
+  function stopInertia(){ cancelAnimationFrame(inertiaRaf); inertiaRaf = 0; vel = 0; }
+  function runInertia(){
+    cancelAnimationFrame(inertiaRaf);
+    if(Math.abs(vel) < 0.0004) return;
+    var step = function(){
+      var span = state.view.b - state.view.a;
+      setView(state.view.a + vel*16, span, true);
+      vel *= 0.93;
+      if(Math.abs(vel) > 0.0004 && state.view.a > 0 && state.view.b < state.dur - 1e-6){
+        inertiaRaf = requestAnimationFrame(step);
+      }
+    };
+    inertiaRaf = requestAnimationFrame(step);
+  }
+
   cv.addEventListener('pointerdown', function(ev){
     cv.setPointerCapture(ev.pointerId);
+    stopInertia();
     var r = cv.getBoundingClientRect();
-    drag = { x0: ev.clientX - r.left, a0: state.view.a, b0: state.view.b, moved:false, t0: Date.now() };
-  });
-  cv.addEventListener('pointermove', function(ev){
-    if(!drag) return;
-    var r = cv.getBoundingClientRect();
-    var x = ev.clientX - r.left, dx = x - drag.x0;
-    if(Math.abs(dx) > 7) drag.moved = true;
-    if(!drag.moved) return;
-    var w = cv.clientWidth || 1, span = drag.b0 - drag.a0;
-    var na = Math.max(0, Math.min(Math.max(0, state.dur - span), drag.a0 - (dx/w)*span));
-    state.view.a = na; state.view.b = na + span;
-    draw();
-  });
-  cv.addEventListener('pointerup', function(ev){
-    if(!drag) return;
-    var r = cv.getBoundingClientRect();
-    var x = ev.clientX - r.left;
-    if(!drag.moved && Date.now() - drag.t0 < 700){
-      var t = timeAtX(x);
-      var w = cv.clientWidth || 1, span = state.view.b - state.view.a, tol = (14/w)*span;
-      var best = null, bd = tol;
-      state.markers.forEach(function(m){
-        var d = Math.abs(m.t - t);
-        if(d < bd){ bd = d; best = m; }
-      });
-      seek(best ? best.t : t);
+    pts[ev.pointerId] = ev.clientX - r.left;
+    var k = ids();
+    if(k.length === 1){
+      gest = { mode:'pan', x0: pts[k[0]], a0: state.view.a, span: state.view.b - state.view.a,
+               moved:false, t0: Date.now(), lastX: pts[k[0]] };
+    } else if(k.length === 2){
+      var x1 = pts[k[0]], x2 = pts[k[1]];
+      gest = { mode:'pinch', d0: Math.max(12, Math.abs(x1-x2)), mid0: (x1+x2)/2,
+               a0: state.view.a, span0: state.view.b - state.view.a,
+               tMid: timeAtX((x1+x2)/2) };
     }
-    drag = null;
   });
-  cv.addEventListener('pointercancel', function(){ drag = null; });
+
+  cv.addEventListener('pointermove', function(ev){
+    if(!gest || pts[ev.pointerId] === undefined) return;
+    var r = cv.getBoundingClientRect(), w = cv.clientWidth || 1;
+    pts[ev.pointerId] = ev.clientX - r.left;
+    var k = ids();
+
+    if(gest.mode === 'pinch' && k.length >= 2){
+      var x1 = pts[k[0]], x2 = pts[k[1]];
+      var d = Math.max(12, Math.abs(x1-x2));
+      var mid = (x1+x2)/2;
+      var span = Math.max(MIN_SPAN, Math.min(state.dur || 1, gest.span0 * (gest.d0 / d)));
+      // o ponto entre os dedos fica quieto
+      setView(gest.tMid - (mid/w)*span, span, true);
+      return;
+    }
+    if(gest.mode === 'pan'){
+      var x = pts[ev.pointerId];
+      var dx = x - gest.x0;
+      if(Math.abs(dx) > 7) gest.moved = true;
+      if(!gest.moved) return;
+      var now = Date.now(), dt = Math.max(1, now - lastMoveAt);
+      var dxStep = x - gest.lastX;
+      vel = -(dxStep / w) * gest.span / dt;    // tempo por ms
+      gest.lastX = x; lastMoveAt = now;
+      setView(gest.a0 - (dx/w)*gest.span, gest.span, true);
+    }
+  });
+
+  function endPointer(ev){
+    if(pts[ev.pointerId] === undefined) return;
+    var x = pts[ev.pointerId];
+    delete pts[ev.pointerId];
+    var remaining = ids().length;
+
+    if(gest && gest.mode === 'pan' && remaining === 0){
+      if(!gest.moved && Date.now() - gest.t0 < 700){
+        var now = Date.now();
+        if(now - lastTap < 320 && Math.abs(x - lastTapX) < 40){
+          lastTap = 0;
+          zoomAt(0.4, timeAtX(x), true);           // duplo toque aproxima
+        } else {
+          lastTap = now; lastTapX = x;
+          var t = timeAtX(x);
+          var w = cv.clientWidth || 1, span = state.view.b - state.view.a, tol = (14/w)*span;
+          var best = null, bd = tol;
+          state.markers.forEach(function(m){ var dd = Math.abs(m.t - t); if(dd < bd){ bd = dd; best = m; } });
+          seek(best ? best.t : t);
+        }
+      } else if(gest.moved){
+        runInertia();
+      }
+    }
+    if(remaining === 0) gest = null;
+    else if(remaining === 1 && gest && gest.mode === 'pinch'){
+      var k = ids();
+      gest = { mode:'pan', x0: pts[k[0]], a0: state.view.a, span: state.view.b - state.view.a,
+               moved:true, t0: Date.now(), lastX: pts[k[0]] };
+    }
+  }
+  cv.addEventListener('pointerup', endPointer);
+  cv.addEventListener('pointercancel', function(ev){ delete pts[ev.pointerId]; if(!ids().length) gest = null; });
+
   cv.addEventListener('wheel', function(ev){
     if(!state.dur) return;
     ev.preventDefault();
+    stopInertia();
     var r = cv.getBoundingClientRect();
-    zoom(ev.deltaY > 0 ? 1.25 : 0.8, timeAtX(ev.clientX - r.left));
+    var span = state.view.b - state.view.a;
+    if(ev.ctrlKey || Math.abs(ev.deltaY) > Math.abs(ev.deltaX)){
+      zoomAt(ev.deltaY > 0 ? 1.18 : 0.85, timeAtX(ev.clientX - r.left), true);
+    } else {
+      setView(state.view.a + (ev.deltaX / (cv.clientWidth||1)) * span, span, true);
+    }
   }, {passive:false});
+
+  // ---------------------------------------------------------------- faixa de visão geral
+  function drawOverview(){
+    var w = ov.clientWidth, h = ov.clientHeight;
+    if(!w || !h) return;
+    var dpr = Math.min(2.5, window.devicePixelRatio || 1);
+    if(ov.width !== Math.round(w*dpr) || ov.height !== Math.round(h*dpr)){
+      ov.width = Math.round(w*dpr); ov.height = Math.round(h*dpr);
+    }
+    go.setTransform(dpr,0,0,dpr,0,0);
+    go.clearRect(0,0,w,h);
+    go.fillStyle = theme.surface; go.fillRect(0,0,w,h);
+
+    var total = state.dur || 1, mid = h/2, amp = h/2 - 3;
+    var p = state.peaks;
+    if(p && p.filled){
+      var saveDetail = state.detail; state.detail = null;   // a visão geral usa sempre o mipmap
+      go.fillStyle = theme.waveSoft;
+      for(var x=0; x<w; x++){
+        var pr = peakAt((x/w)*total, ((x+1)/w)*total);
+        if(pr[0] <= 0) continue;
+        var hh = Math.max(1, pr[0]*amp*2);
+        go.fillRect(x, mid - hh/2, 1, hh);
+      }
+      state.detail = saveDetail;
+    } else {
+      go.fillStyle = theme.line; go.fillRect(0, Math.round(mid), w, 1);
+    }
+
+    go.fillStyle = theme.marker;
+    state.markers.forEach(function(m){
+      var x = Math.round((m.t/total)*w) + 0.5;
+      go.globalAlpha = .85; go.fillRect(x, 0, 1, h); go.globalAlpha = 1;
+    });
+
+    var wa = (state.view.a/total)*w, wb = (state.view.b/total)*w;
+    go.fillStyle = theme.ink;
+    go.globalAlpha = 0.10; go.fillRect(wa, 0, Math.max(2, wb-wa), h); go.globalAlpha = 1;
+    go.strokeStyle = theme.accent; go.lineWidth = 1.5;
+    go.strokeRect(Math.max(0.75, wa), 0.75, Math.min(w-1.5, Math.max(3, wb-wa)), h-1.5);
+
+    var ht = headTime();
+    go.fillStyle = theme.play;
+    go.fillRect(Math.round((ht/total)*w) + 0.5, 0, 1.5, h);
+  }
+
+  var ovDrag = false;
+  function ovJump(ev){
+    if(!state.dur) return;
+    var r = ov.getBoundingClientRect();
+    var frac = Math.max(0, Math.min(1, (ev.clientX - r.left) / (r.width || 1)));
+    var span = state.view.b - state.view.a;
+    setView(frac*state.dur - span/2, span, true);
+  }
+  ov.addEventListener('pointerdown', function(ev){ ov.setPointerCapture(ev.pointerId); ovDrag = true; stopInertia(); ovJump(ev); });
+  ov.addEventListener('pointermove', function(ev){ if(ovDrag) ovJump(ev); });
+  ov.addEventListener('pointerup', function(){ ovDrag = false; });
+  ov.addEventListener('pointercancel', function(){ ovDrag = false; });
 
   // ---------------------------------------------------------------- controls
   $('pick').addEventListener('change', function(e){ if(e.target.files[0]) openFile(e.target.files[0], false); e.target.value=''; });
@@ -1161,6 +1441,7 @@
   $('loop').addEventListener('click', function(){
     state.loop = !state.loop;
     this.setAttribute('aria-pressed', state.loop ? 'true' : 'false');
+    save();
     if(state.loop){
       var s = segment();
       toast(s ? 'Loop entre ' + fmt(s.a) + ' e ' + fmt(s.b) : 'Loop ativo a partir da próxima marca.');
@@ -1203,7 +1484,7 @@
   });
 
   // ---------------------------------------------------------------- loop de desenho
-  var raf = 0;
+  var raf = 0, lastSave = 0;
   function tick(){
     cancelAnimationFrame(raf);
     var t = headTime();
@@ -1211,9 +1492,10 @@
       var s = segment();
       if(s && t >= s.b - 0.02){ seek(s.a); t = s.a; }
     }
-    if(isPlaying()) ensureVisible(t);
+    if(isPlaying() && Date.now() > followPause) ensureVisible(t);
     $('tDur').textContent = '/ ' + fmt(state.dur);
     draw();
+    if(isPlaying() && Date.now() - lastSave > 4000){ lastSave = Date.now(); saveNow(); }
     if(isPlaying()) raf = requestAnimationFrame(tick);
   }
 
@@ -1225,12 +1507,13 @@
   new MutationObserver(function(){ readTheme(); draw(); })
     .observe(document.documentElement, {attributes:true, attributeFilter:['data-theme']});
   var ro = new ResizeObserver(function(){ draw(); });
-  ro.observe(cv);
+  ro.observe(cv); ro.observe($('ov'));
   window.addEventListener('resize', function(){ readTheme(); draw(); });
   setInterval(function(){ if(!isPlaying()) draw(); }, 400);
 
   syncPlayBtn();
   openFile(demoFile(), true);
+  setTimeout(showResume, 900);
 })();
 </script>
 
