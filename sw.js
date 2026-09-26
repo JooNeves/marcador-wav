@@ -1,5 +1,5 @@
 /* Marcador WAV — service worker: cache-first para a app, para funcionar sem rede. */
-var CACHE = 'marcador-wav-v5';
+var CACHE = 'marcador-wav-v6';
 var ASSETS = [
   './',
   './index.html',

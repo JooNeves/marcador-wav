@@ -249,7 +249,7 @@
 (function(){
   "use strict";
 
-  var VERSION = '4';
+  var VERSION = '6';
 
   // ---------------------------------------------------------------- helpers
   var $ = function(id){ return document.getElementById(id); };
@@ -298,6 +298,8 @@
     size: 0,
     sr: null, bits: null, channels: null,
     dur: 0,
+    file: null,
+    wav: null,          // info dos chunks quando é WAV PCM/float
     peaks: null,        // {pk:Float32Array, n, fpb, filled}
     markers: [],
     view: {a:0, b:1},
@@ -312,27 +314,82 @@
   // por isso a reprodução usa um elemento <audio> e a forma de onda é lida do ficheiro por fatias.
   var audio = new Audio();
   audio.preload = 'auto';
-  audio.addEventListener('ended', function(){ syncPlayBtn(); draw(); });
+  var anchor = 0;          // instante do ficheiro onde começa o blob que está no <audio>
+  var wantPlay = false;
+
+  audio.addEventListener('ended', function(){
+    if(state.wav && anchor + (audio.duration || 0) < state.dur - 0.05) return;
+    syncPlayBtn(); draw();
+  });
   audio.addEventListener('play', function(){ syncPlayBtn(); tick(); });
   audio.addEventListener('pause', function(){ syncPlayBtn(); draw(); });
+  audio.addEventListener('canplay', function(){
+    if(wantPlay){ wantPlay = false; var p = audio.play(); if(p && p['catch']) p['catch'](function(){}); }
+  });
 
-  function headTime(){ var t = audio.currentTime; return isFinite(t) ? t : 0; }
+  function headTime(){
+    var t = anchor + (isFinite(audio.currentTime) ? audio.currentTime : 0);
+    if(state.dur && t > state.dur) t = state.dur;
+    return t;
+  }
   function isPlaying(){ return !audio.paused && !audio.ended; }
   function play(){
+    if(state.wav && audio.readyState === 0){ wantPlay = true; return; }
     var p = audio.play();
     if(p && p['catch']) p['catch'](function(e){ toast('Não consegui reproduzir' + (e && e.message ? ' (' + e.message + ')' : '') + '.'); });
   }
-  function pause(){ audio.pause(); }
+  function pause(){ wantPlay = false; audio.pause(); }
   function toggle(){ isPlaying() ? pause() : play(); }
+
+  // Os browsers não são de confiança a saltar dentro de um blob grande — no Safari em
+  // particular a reprodução pára a meio. Em vez de mexer no currentTime, monta-se um WAV
+  // novo que começa no ponto pedido: o cabeçalho é gerado e o áudio é uma fatia do ficheiro
+  // (uma referência, não uma cópia). O <audio> só tem de tocar do princípio ao fim.
+  function wavHeader(info, dataBytes){
+    var ab = new ArrayBuffer(44), dv = new DataView(ab), o = 0;
+    var W = function(str){ for(var i=0;i<str.length;i++) dv.setUint8(o++, str.charCodeAt(i)); };
+    var U32 = function(v){ dv.setUint32(o, v, true); o += 4; };
+    var U16 = function(v){ dv.setUint16(o, v, true); o += 2; };
+    var frameSize = (info.bits >> 3) * info.channels;
+    W('RIFF'); U32(36 + dataBytes); W('WAVE');
+    W('fmt '); U32(16); U16(info.fmtTag === 3 ? 3 : 1); U16(info.channels);
+    U32(info.sr); U32(info.sr * frameSize); U16(frameSize); U16(info.bits);
+    W('data'); U32(dataBytes);
+    return ab;
+  }
+  function setSource(t, resume){
+    var info = state.wav;
+    if(!info || !state.file){
+      try{ audio.currentTime = Math.max(0, Math.min(state.dur || 0, t)); }catch(e){}
+      if(resume) play();
+      draw();
+      return;
+    }
+    var frameSize = (info.bits >> 3) * info.channels;
+    var dataEnd = info.dataOffset + info.dataSize;
+    var frame = Math.max(0, Math.floor(Math.max(0, Math.min(state.dur, t)) * info.sr));
+    var byteStart = Math.min(dataEnd, info.dataOffset + frame * frameSize);
+    var bytes = dataEnd - byteStart;
+    var blob = new Blob([wavHeader(info, bytes), state.file.slice(byteStart, dataEnd)], {type:'audio/wav'});
+    var old = objUrl;
+    objUrl = URL.createObjectURL(blob);
+    anchor = frame / info.sr;
+    wantPlay = !!resume;
+    audio.src = objUrl;
+    audio.load();
+    if(old) setTimeout(function(){ try{ URL.revokeObjectURL(old); }catch(e){} }, 2000);
+    if(resume) play();
+    draw();
+  }
   function seek(t){
     t = Math.max(0, Math.min(state.dur || 0, t));
-    try{ audio.currentTime = t; }catch(e){}
-    draw();
+    setSource(t, isPlaying() || wantPlay);
   }
   function syncPlayBtn(){
     var b = $('play');
-    b.textContent = isPlaying() ? '❚❚' : '▶';
-    b.setAttribute('aria-label', isPlaying() ? 'Pausa' : 'Reproduzir');
+    var on = isPlaying() || wantPlay;
+    b.textContent = on ? '❚❚' : '▶';
+    b.setAttribute('aria-label', on ? 'Pausa' : 'Reproduzir');
   }
 
   // ---------------------------------------------------------------- leitura dos chunks do WAV (por fatias, sem carregar o ficheiro)
@@ -435,6 +492,9 @@
 
   // ---------------------------------------------------------------- forma de onda lida por fatias
   var TARGET_BUCKETS = 180000;
+  var MAX_READ = 256 * 1024 * 1024;   // acima disto a onda é amostrada, para não ler gigabytes
+  var SPAN_BYTES = 16 * 1024 * 1024;  // quanto do ficheiro cada passo representa
+
   function buildPeaksFromFile(file, info, token){
     var bps = info.bits >> 3, ch = info.channels, frameSize = bps * ch;
     if(!frameSize || info.dataOffset == null || !info.dataSize) return;
@@ -447,28 +507,49 @@
     var pk = new Float32Array(n), rms = new Float32Array(n);
     state.peaks = { pk: pk, rms: rms, n: n, fpb: fpb, filled: 0, sr: info.sr };
 
-    var SLICE_BYTES = 8 * 1024 * 1024;
-    var bucketsPerSlice = Math.max(1, Math.floor(SLICE_BYTES / (fpb * frameSize)));
-    var stride = Math.max(1, Math.floor(fpb / 24));   // amostras por bucket, suficiente para o desenho
-    var b0 = 0;
+    var frac = info.dataSize > MAX_READ ? MAX_READ / info.dataSize : 1;
+    state.sampled = frac < 1;
+    var bucketBytes = fpb * frameSize;
+    var bucketsPerStep = Math.max(1, Math.floor(SPAN_BYTES / bucketBytes));
+    var readBuckets = Math.max(1, Math.round(bucketsPerStep * frac));
+    var b0 = 0, fails = 0;
 
-    function nextSlice(){
+    function stepOn(){
       if(token !== state.scanToken) return;
-      if(b0 >= n){ hint(); draw(); return; }
-      var bEnd = Math.min(n, b0 + bucketsPerSlice);
-      var byteA = info.dataOffset + b0 * fpb * frameSize;
-      var byteB = Math.min(info.dataOffset + info.dataSize, info.dataOffset + bEnd * fpb * frameSize);
+      if(b0 >= n){
+        state.peaks.filled = n;
+        hint(state.sampled ? 'Forma de onda por amostragem (ficheiro grande)' : '');
+        draw();
+        return;
+      }
+      var bEnd = Math.min(n, b0 + bucketsPerStep);
+      var bRead = Math.min(bEnd, b0 + readBuckets);
+      var byteA = info.dataOffset + b0 * bucketBytes;
+      var byteB = Math.min(info.dataOffset + info.dataSize, info.dataOffset + bRead * bucketBytes);
+
       slice(file, byteA, byteB).then(function(buf){
         if(token !== state.scanToken) return;
-        fillBuckets(buf, info, pk, rms, b0, bEnd, fpb, frameSize, stride, frames);
+        fails = 0;
+        fillBuckets(buf, info, pk, rms, b0, bRead, fpb, frameSize, Math.max(1, Math.floor(fpb/24)), frames);
+        // os buckets não lidos deste passo herdam o último valor, para a onda não ficar aos buracos
+        var lastP = pk[bRead-1] || 0, lastR = rms[bRead-1] || 0;
+        for(var b=bRead; b<bEnd; b++){ pk[b] = lastP; rms[b] = lastR; }
         state.peaks.filled = bEnd;
         b0 = bEnd;
         hint('Forma de onda ' + Math.round(100*bEnd/n) + '%');
         draw();
-        setTimeout(nextSlice, 0);
-      })['catch'](function(){ hint('Não consegui ler o ficheiro todo para a forma de onda.'); });
+        setTimeout(stepOn, 0);
+      })['catch'](function(e){
+        if(token !== state.scanToken) return;
+        if(++fails <= 3){ setTimeout(stepOn, 250 * fails); return; }
+        var why = e && e.message ? e.message : (e && e.name ? e.name : 'motivo desconhecido');
+        state.peaks.filled = b0;
+        hint('Onda parou aos ' + Math.round(100*b0/n) + '% — ' + why);
+        toast('A forma de onda parou aos ' + Math.round(100*b0/n) + '%: ' + why + '. A reprodução continua a funcionar.', 8000);
+        draw();
+      });
     }
-    nextSlice();
+    stepOn();
   }
 
   function fillBuckets(buf, info, pk, rms, b0, bEnd, fpb, frameSize, stride, totalFrames){
@@ -518,7 +599,9 @@
     file.arrayBuffer().then(function(ab){
       if(token !== state.scanToken) return;
       var c = new AC();
+      var settled = false;
       var ok = function(buffer){
+        if(settled) return; settled = true;
         if(token !== state.scanToken){ try{ c.close(); }catch(e){} return; }
         var frames = buffer.length, chs = [], k;
         for(k=0;k<buffer.numberOfChannels;k++) chs.push(buffer.getChannelData(k));
@@ -538,7 +621,7 @@
         renderMeta(); hint(); draw();
         try{ c.close(); }catch(e){}
       };
-      var no = function(){ hint('Sem forma de onda: o browser não descodificou este formato.'); try{ c.close(); }catch(e){} };
+      var no = function(){ if(settled) return; settled = true; hint('Sem forma de onda: o browser não descodificou este formato.'); try{ c.close(); }catch(e){} };
       try{
         var p = c.decodeAudioData(ab, ok, no);
         if(p && p.then) p.then(ok)['catch'](no);
@@ -867,23 +950,27 @@
     if(objUrl){ try{ URL.revokeObjectURL(objUrl); }catch(e){} }
     objUrl = URL.createObjectURL(file);
 
+    state.file = file; state.wav = null;
     state.name = file.name; state.isDemo = !!isDemo; state.size = file.size;
     state.sr = null; state.bits = null; state.channels = null;
-    state.peaks = null; state.dur = 0; state.markers = [];
+    state.peaks = null; state.dur = 0; state.markers = []; anchor = 0; wantPlay = false;
     renderMeta(); renderList(); hint(); draw();
     busy(true, 'A abrir ' + mb(file.size) + '…');
 
-    var metaDone = false, scanDone = false, info = null;
+    var metaDone = false, scanDone = false, info = null, finished = false;
 
     function finish(){
-      if(!metaDone || !scanDone || token !== state.scanToken) return;
+      if(finished || !metaDone || !scanDone || token !== state.scanToken) return;
+      finished = true;
       busy(false);
-      if(info){
+      if(info && info.sr && info.channels && info.bits && (info.fmtTag === 1 || info.fmtTag === 3)){
         state.sr = info.sr; state.bits = info.bits; state.channels = info.channels;
-        if(!isFinite(state.dur) || state.dur <= 0){
-          var fsz = (info.bits >> 3) * info.channels;
-          if(fsz) state.dur = Math.floor(info.dataSize / fsz) / info.sr;
-        }
+        var fsz = (info.bits >> 3) * info.channels;
+        if(fsz && info.dataSize) state.dur = Math.floor(info.dataSize / fsz) / info.sr;
+        state.wav = info;          // a partir daqui a reprodução usa fatias do ficheiro
+        setSource(0, false);
+      } else if(info){
+        state.sr = info.sr; state.bits = info.bits; state.channels = info.channels;
       }
       var embedded = [];
       if(info && info.cues.length){
@@ -910,13 +997,21 @@
 
     audio.onloadedmetadata = function(){
       if(token !== state.scanToken) return;
-      state.dur = isFinite(audio.duration) ? audio.duration : 0;
+      // num WAV a duração vem dos chunks: o <audio> só tem a fatia a partir do ponto atual
+      if(!state.wav) state.dur = isFinite(audio.duration) ? audio.duration : 0;
       metaDone = true; finish();
+      syncPlayBtn(); draw();
     };
     audio.onerror = function(){
-      if(token !== state.scanToken) return;
+      if(token !== state.scanToken || finished) return;
       busy(false);
-      toast('O browser não conseguiu abrir este ficheiro de áudio.', 6000);
+      var e = audio.error, why = '';
+      if(e){
+        var names = {1:'leitura interrompida', 2:'erro de rede', 3:'falha ao descodificar', 4:'formato não suportado'};
+        why = ' (' + (names[e.code] || ('código ' + e.code)) + (e.message ? ': ' + e.message : '') + ')';
+      }
+      toast('O browser não conseguiu abrir este áudio' + why + '.', 9000);
+      hint('Áudio não abriu' + why);
       metaDone = true; finish();
     };
     audio.src = objUrl;
