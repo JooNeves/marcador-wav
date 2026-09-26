@@ -382,7 +382,7 @@
     var riff = tag(0);
     if(riff !== 'RIFF' && riff !== 'RF64') return null;
     if(tag(8) !== 'WAVE') return null;
-    var out = { sr:null, bits:null, channels:null, cues:[], labels:{}, lengths:{} };
+    var out = { sr:null, bits:null, channels:null, fmtTag:null, dataOffset:null, dataSize:0, cues:[], labels:{}, lengths:{} };
     var p = 12;
     while(p + 8 <= ab.byteLength){
       var id = tag(p);
@@ -390,9 +390,15 @@
       var body = p + 8;
       if(size < 0 || body + size > ab.byteLength) size = ab.byteLength - body;
       if(id === 'fmt '){
+        out.fmtTag = dv.getUint16(body, true);
         out.channels = dv.getUint16(body+2, true);
         out.sr = dv.getUint32(body+4, true);
         if(size >= 16) out.bits = dv.getUint16(body+14, true);
+        // WAVE_FORMAT_EXTENSIBLE: o formato real está nos 2 primeiros bytes do GUID
+        if(out.fmtTag === 0xFFFE && size >= 40) out.fmtTag = dv.getUint16(body+24, true);
+      } else if(id === 'data'){
+        out.dataOffset = body;
+        out.dataSize = size;
       } else if(id === 'cue '){
         var n = dv.getUint32(body, true);
         for(var i=0;i<n;i++){
@@ -425,6 +431,62 @@
       p = body + size + (size & 1);
     }
     return out;
+  }
+
+  // ---------------------------------------------------------------- descodificador WAV próprio (PCM e float)
+  // O descodificador do browser recusa alguns WAV (24 bit, extensible, chunks extra).
+  // Como já lemos os chunks, convertemos as amostras nós próprios — resultado previsível.
+  function decodeWavPcm(ab, info){
+    if(!info || info.dataOffset == null || !info.dataSize) return { err:'sem chunk data' };
+    if(!info.sr || !info.channels || !info.bits) return { err:'sem chunk fmt' };
+    var tag = info.fmtTag;
+    if(tag !== 1 && tag !== 3) return { err:'formato comprimido (código ' + tag + ')' };
+    var c = getCtx();
+    if(!c) return { err:'sem Web Audio' };
+
+    var ch = info.channels, bits = info.bits, bps = bits >> 3;
+    if(bps < 1 || bps > 8) return { err:bits + ' bit não suportado' };
+    var frameSize = bps * ch;
+    var frames = Math.floor(Math.min(info.dataSize, ab.byteLength - info.dataOffset) / frameSize);
+    if(frames < 1) return { err:'sem amostras' };
+
+    var buf;
+    try{ buf = c.createBuffer(ch, frames, info.sr); }
+    catch(e){ return { err:'memória insuficiente para ' + (frames/info.sr/60).toFixed(1) + ' min a ' + info.sr + ' Hz' }; }
+
+    var chans = [], k;
+    for(k=0;k<ch;k++) chans.push(buf.getChannelData(k));
+    var off = info.dataOffset, i, j, v;
+
+    if(tag === 1 && bits === 16 && off % 2 === 0){
+      var i16 = new Int16Array(ab, off, frames*ch);
+      for(i=0;i<frames;i++) for(k=0;k<ch;k++) chans[k][i] = i16[i*ch+k] / 32768;
+    } else if(tag === 3 && bits === 32 && off % 4 === 0){
+      var f32 = new Float32Array(ab, off, frames*ch);
+      for(i=0;i<frames;i++) for(k=0;k<ch;k++) chans[k][i] = f32[i*ch+k];
+    } else {
+      var dv = new DataView(ab, off, frames*frameSize);
+      for(i=0;i<frames;i++){
+        for(k=0;k<ch;k++){
+          j = i*frameSize + k*bps;
+          if(tag === 3){
+            v = bits === 64 ? dv.getFloat64(j, true) : dv.getFloat32(j, true);
+          } else if(bits === 8){
+            v = (dv.getUint8(j) - 128) / 128;
+          } else if(bits === 16){
+            v = dv.getInt16(j, true) / 32768;
+          } else if(bits === 24){
+            v = ((dv.getUint8(j) | (dv.getUint8(j+1) << 8) | (dv.getInt8(j+2) << 16))) / 8388608;
+          } else if(bits === 32){
+            v = dv.getInt32(j, true) / 2147483648;
+          } else {
+            v = 0;
+          }
+          chans[k][i] = v;
+        }
+      }
+    }
+    return { buffer: buf };
   }
 
   // ---------------------------------------------------------------- marker text import (Reaper CSV, Audacity labels, plain)
@@ -832,15 +894,25 @@
         }
         sortMarkers(); renderMeta(); renderList(); busy(false); draw();
       };
-      var fail = function(){
+      var ownErr = null;
+      var fail = function(e){
         if(settled) return; settled = true;
         busy(false);
-        toast('Não consegui descodificar este áudio.');
+        var why = ownErr ? ' (' + ownErr + ')' : (e && e.message ? ' (' + e.message + ')' : '');
+        toast('Não consegui descodificar este áudio' + why + '.');
       };
-      try{
-        var p = c.decodeAudioData(ab, done, fail);
-        if(p && p.then) p.then(done)['catch'](fail);
-      }catch(e){ fail(); }
+      var browserDecode = function(){
+        try{
+          var p = c.decodeAudioData(ab, done, fail);
+          if(p && p.then) p.then(done)['catch'](fail);
+        }catch(e){ fail(e); }
+      };
+      // primeiro o nosso descodificador: lida com 24 bit, float e extensible,
+      // que são precisamente os que o browser costuma recusar
+      var own = null;
+      try{ own = decodeWavPcm(ab, info); }catch(e){ own = { err: e && e.message ? e.message : 'erro interno' }; }
+      if(own && own.buffer){ done(own.buffer); }
+      else { ownErr = own && own.err; browserDecode(); }
     };
     fr.readAsArrayBuffer(file);
   }
