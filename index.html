@@ -199,7 +199,6 @@
   }
   @media (max-width:560px){
     #app{padding:8px 12px 10px;}
-    .brand span{display:none;}
     .clock{width:100%; margin-left:0; justify-content:space-between;}
     .markers{max-height:38vh;}
   }
@@ -207,10 +206,10 @@
 
 <div id="app">
   <div class="top">
-    <div class="brand"><b>Marcador WAV</b><span>cues &amp; playback</span></div>
+    <div class="brand"><b>Marcador WAV</b><span id="ver">v4</span></div>
     <label class="btn primary" for="pick">Abrir áudio</label>
     <input id="pick" type="file" accept="audio/*,.wav,.wave,.mp3,.m4a,.aac,.aif,.aiff,.flac,.ogg,.opus,.caf" hidden>
-    <label class="btn" for="pickCsv">Marcas (CSV)</label>
+    <label class="btn" for="pickCsv">Marcas</label>
     <input id="pickCsv" type="file" accept=".csv,.txt,text/csv,text/plain" hidden>
   </div>
 
@@ -250,6 +249,8 @@
 (function(){
   "use strict";
 
+  var VERSION = '4';
+
   // ---------------------------------------------------------------- helpers
   var $ = function(id){ return document.getElementById(id); };
   var cv = $('cv'), g = cv.getContext('2d');
@@ -265,107 +266,76 @@
     return (h ? h+':'+p2(m) : ''+m) + ':' + p2(s) + '.' + p3(ms);
   }
   function fmtShort(t){
-    var m = Math.floor(t/60), s = Math.floor(t)%60;
-    return m + ':' + (s<10?'0':'') + s;
+    if(!isFinite(t)) t = 0;
+    var h = Math.floor(t/3600), m = Math.floor(t/60)%60, s = Math.floor(t)%60;
+    var p2 = function(n){ return n<10 ? '0'+n : ''+n; };
+    return h ? h+':'+p2(m)+':'+p2(s) : m+':'+p2(s);
+  }
+  function mb(bytes){
+    if(bytes >= 1073741824) return (bytes/1073741824).toFixed(2) + ' GB';
+    return Math.round(bytes/1048576) + ' MB';
   }
   var toastEl = null, toastTimer = 0;
-  function toast(msg){
+  function toast(msg, ms){
     if(toastEl) toastEl.remove();
     toastEl = document.createElement('div');
     toastEl.className = 'toast'; toastEl.textContent = msg;
     document.body.appendChild(toastEl);
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(function(){ if(toastEl){ toastEl.remove(); toastEl = null; } }, 2600);
+    toastTimer = setTimeout(function(){ if(toastEl){ toastEl.remove(); toastEl = null; } }, ms || 4000);
   }
   function busy(on, txt){
     $('busy').hidden = !on;
     if(txt) $('busyTxt').textContent = txt;
   }
+  var HINT = 'Toca para posicionar · arrasta para deslocar';
+  function hint(txt){ $('hint').textContent = txt || HINT; }
 
   // ---------------------------------------------------------------- state
   var state = {
     name: 'Exemplo',
     isDemo: true,
-    sr: 44100,
+    size: 0,
+    sr: null, bits: null, channels: null,
     dur: 0,
-    channels: 1,
-    bits: null,
-    buffer: null,      // AudioBuffer
-    chans: [],         // Float32Array per channel
-    peaks: null,       // {min:Float32Array, max:Float32Array, bucket:int, n:int}
-    markers: [],       // {id, t, end|null, name}
+    peaks: null,        // {pk:Float32Array, n, fpb, filled}
+    markers: [],
     view: {a:0, b:1},
-    head: 0,
-    playing: false,
-    loop: false
+    loop: false,
+    scanToken: 0
   };
   var uid = 1;
+  var objUrl = null;
 
-  // ---------------------------------------------------------------- audio
-  var ctx = null, gain = null, srcNode = null, srcToken = 0, startedAt = 0, startedFrom = 0;
-  function getCtx(){
-    if(!ctx){
-      var AC = window.AudioContext || window.webkitAudioContext;
-      if(!AC) return null;
-      ctx = new AC();
-      gain = ctx.createGain();
-      gain.connect(ctx.destination);
-    }
-    return ctx;
-  }
-  function stopSource(){
-    srcToken++;
-    if(srcNode){
-      try{ srcNode.onended = null; srcNode.stop(); }catch(e){}
-      try{ srcNode.disconnect(); }catch(e){}
-      srcNode = null;
-    }
-  }
-  function headTime(){
-    if(state.playing && ctx) return Math.min(state.dur, startedFrom + (ctx.currentTime - startedAt));
-    return state.head;
-  }
+  // ---------------------------------------------------------------- playback: <audio>, para o browser transmitir do disco
+  // Ficheiros de show passam facilmente de 1 GB. Descodificar tudo para memória não é opção,
+  // por isso a reprodução usa um elemento <audio> e a forma de onda é lida do ficheiro por fatias.
+  var audio = new Audio();
+  audio.preload = 'auto';
+  audio.addEventListener('ended', function(){ syncPlayBtn(); draw(); });
+  audio.addEventListener('play', function(){ syncPlayBtn(); tick(); });
+  audio.addEventListener('pause', function(){ syncPlayBtn(); draw(); });
+
+  function headTime(){ var t = audio.currentTime; return isFinite(t) ? t : 0; }
+  function isPlaying(){ return !audio.paused && !audio.ended; }
   function play(){
-    var c = getCtx();
-    if(!c || !state.buffer) return;
-    if(c.state === 'suspended'){ c.resume(); }
-    stopSource();
-    var from = state.head;
-    if(from >= state.dur - 0.005) from = 0;
-    var tok = ++srcToken;
-    srcNode = c.createBufferSource();
-    srcNode.buffer = state.buffer;
-    srcNode.connect(gain);
-    srcNode.onended = function(){
-      if(tok !== srcToken) return;
-      state.playing = false; state.head = state.dur; syncPlayBtn(); draw();
-    };
-    srcNode.start(0, from);
-    startedAt = c.currentTime; startedFrom = from;
-    state.playing = true; state.head = from;
-    syncPlayBtn(); tick();
+    var p = audio.play();
+    if(p && p['catch']) p['catch'](function(e){ toast('Não consegui reproduzir' + (e && e.message ? ' (' + e.message + ')' : '') + '.'); });
   }
-  function pause(){
-    var t = headTime();
-    stopSource();
-    state.playing = false; state.head = t;
-    syncPlayBtn(); draw();
-  }
-  function toggle(){ state.playing ? pause() : play(); }
-  function seek(t, keepPlaying){
-    t = Math.max(0, Math.min(state.dur, t));
-    var wasPlaying = state.playing;
-    stopSource(); state.playing = false;
-    state.head = t;
-    if(wasPlaying && keepPlaying !== false) play(); else { syncPlayBtn(); draw(); }
+  function pause(){ audio.pause(); }
+  function toggle(){ isPlaying() ? pause() : play(); }
+  function seek(t){
+    t = Math.max(0, Math.min(state.dur || 0, t));
+    try{ audio.currentTime = t; }catch(e){}
+    draw();
   }
   function syncPlayBtn(){
     var b = $('play');
-    b.textContent = state.playing ? '❚❚' : '▶';
-    b.setAttribute('aria-label', state.playing ? 'Pausa' : 'Reproduzir');
+    b.textContent = isPlaying() ? '❚❚' : '▶';
+    b.setAttribute('aria-label', isPlaying() ? 'Pausa' : 'Reproduzir');
   }
 
-  // ---------------------------------------------------------------- WAV chunk parsing
+  // ---------------------------------------------------------------- leitura dos chunks do WAV (por fatias, sem carregar o ficheiro)
   function decodeText(bytes){
     var s;
     try{ s = new TextDecoder('utf-8', {fatal:false}).decode(bytes); }catch(e){ s = null; }
@@ -375,148 +345,421 @@
     }
     return s.replace(/\0+$/,'').trim();
   }
-  function readCues(ab){
-    var dv = new DataView(ab), u8 = new Uint8Array(ab);
-    var tag = function(o){ return String.fromCharCode(u8[o],u8[o+1],u8[o+2],u8[o+3]); };
-    if(ab.byteLength < 12) return null;
-    var riff = tag(0);
-    if(riff !== 'RIFF' && riff !== 'RF64') return null;
-    if(tag(8) !== 'WAVE') return null;
-    var out = { sr:null, bits:null, channels:null, fmtTag:null, dataOffset:null, dataSize:0, cues:[], labels:{}, lengths:{} };
-    var p = 12;
-    while(p + 8 <= ab.byteLength){
-      var id = tag(p);
-      var size = dv.getUint32(p+4, true);
-      var body = p + 8;
-      if(size < 0 || body + size > ab.byteLength) size = ab.byteLength - body;
-      if(id === 'fmt '){
-        out.fmtTag = dv.getUint16(body, true);
-        out.channels = dv.getUint16(body+2, true);
-        out.sr = dv.getUint32(body+4, true);
-        if(size >= 16) out.bits = dv.getUint16(body+14, true);
-        // WAVE_FORMAT_EXTENSIBLE: o formato real está nos 2 primeiros bytes do GUID
-        if(out.fmtTag === 0xFFFE && size >= 40) out.fmtTag = dv.getUint16(body+24, true);
-      } else if(id === 'data'){
-        out.dataOffset = body;
-        out.dataSize = size;
-      } else if(id === 'cue '){
-        var n = dv.getUint32(body, true);
-        for(var i=0;i<n;i++){
-          var o = body + 4 + i*24;
-          if(o + 24 > ab.byteLength) break;
-          var nameId = dv.getUint32(o, true);
-          var pos = dv.getUint32(o+4, true);
-          var off = dv.getUint32(o+20, true);
-          out.cues.push({ id:nameId, sample: off || pos });
-        }
-      } else if(id === 'LIST' && size >= 4 && tag(body) === 'adtl'){
-        var q = body + 4, end = body + size;
-        while(q + 8 <= end){
-          var sid = tag(q), ssize = dv.getUint32(q+4, true), sbody = q + 8;
-          if(sbody + ssize > end) ssize = end - sbody;
-          if((sid === 'labl' || sid === 'note') && ssize >= 4){
-            var cid = dv.getUint32(sbody, true);
-            var txt = decodeText(u8.subarray(sbody+4, sbody+ssize));
-            if(txt && (sid === 'labl' || !out.labels[cid])) out.labels[cid] = txt;
-          } else if(sid === 'ltxt' && ssize >= 20){
-            var lid = dv.getUint32(sbody, true);
-            var slen = dv.getUint32(sbody+4, true);
-            if(slen > 0) out.lengths[lid] = slen;
-            var lt = decodeText(u8.subarray(sbody+20, sbody+ssize));
-            if(lt && !out.labels[lid]) out.labels[lid] = lt;
+  function tag4(u8, o){ return String.fromCharCode(u8[o],u8[o+1],u8[o+2],u8[o+3]); }
+  function slice(file, a, b){ return file.slice(a, b).arrayBuffer(); }
+
+  // devolve uma promessa com {sr,bits,channels,fmtTag,dataOffset,dataSize,cues,labels,lengths} ou null
+  function scanWav(file){
+    return slice(file, 0, 12).then(function(hb){
+      var hu = new Uint8Array(hb);
+      if(hu.length < 12) return null;
+      var riff = tag4(hu, 0);
+      if((riff !== 'RIFF' && riff !== 'RF64') || tag4(hu, 8) !== 'WAVE') return null;
+      var out = { sr:null, bits:null, channels:null, fmtTag:null, dataOffset:null, dataSize:0,
+                  cues:[], labels:{}, lengths:{}, rf64: riff === 'RF64', ds64Data:null };
+      var size = file.size, pos = 12, guard = 0;
+
+      function step(){
+        if(pos + 8 > size || guard++ > 400) return out;
+        return slice(file, pos, pos + 8).then(function(hbuf){
+          var h = new Uint8Array(hbuf);
+          if(h.length < 8) return out;
+          var id = tag4(h, 0);
+          var dv0 = new DataView(hbuf);
+          var csz = dv0.getUint32(4, true);
+          var body = pos + 8;
+          var want = null;
+          if(id === 'ds64') want = Math.min(csz, 96);
+          else if(id === 'fmt ') want = Math.min(csz, 64);
+          else if(id === 'cue ') want = Math.min(csz, 4 + 24*4096);
+          else if(id === 'LIST') want = Math.min(csz, 4*1024*1024);
+          if(id === 'data'){
+            out.dataOffset = body;
+            out.dataSize = (csz === 0xFFFFFFFF && out.ds64Data != null) ? out.ds64Data : Math.min(csz, size - body);
+            if(csz === 0xFFFFFFFF && out.ds64Data == null) out.dataSize = size - body;
           }
-          q = sbody + ssize + (ssize & 1);
-        }
+          var after = function(){
+            var adv = (csz === 0xFFFFFFFF) ? out.dataSize : csz;
+            pos = body + adv + (adv & 1);
+            return step();
+          };
+          if(want == null || want <= 0) return after();
+          return slice(file, body, body + want).then(function(cb){
+            parseChunk(out, id, cb);
+            return after();
+          });
+        });
       }
-      p = body + size + (size & 1);
-    }
-    return out;
+      return step();
+    })['catch'](function(){ return null; });
   }
 
-  // ---------------------------------------------------------------- descodificador WAV próprio (PCM e float)
-  // O descodificador do browser recusa alguns WAV (24 bit, extensible, chunks extra).
-  // Como já lemos os chunks, convertemos as amostras nós próprios — resultado previsível.
-  // Descodifica por fatias, cedendo o fio ao ecrã entre elas: num ficheiro de 6 min
-  // a 24 bit são ~35 milhões de amostras, e de uma só vez o telemóvel dava o ar por perdido.
-  // done(erro, buffer); onProgress(0..1)
-  function decodeWavPcm(ab, info, onProgress, done){
-    if(!info || info.dataOffset == null || !info.dataSize) return done('sem chunk data');
-    if(!info.sr || !info.channels || !info.bits) return done('sem chunk fmt');
-    var tag = info.fmtTag;
-    if(tag !== 1 && tag !== 3) return done('formato comprimido (código ' + tag + ')');
-    var c = getCtx();
-    if(!c) return done('sem Web Audio');
-
-    var ch = info.channels, bits = info.bits, bps = bits >> 3;
-    if(bps < 1 || bps > 8) return done(bits + ' bit não suportado');
-    var frameSize = bps * ch;
-    var avail = Math.min(info.dataSize, ab.byteLength - info.dataOffset);
-    var frames = Math.floor(avail / frameSize);
-    if(frames < 1) return done('sem amostras');
-
-    var buf;
-    try{ buf = c.createBuffer(ch, frames, info.sr); }
-    catch(e){ return done('memória insuficiente para ' + fmtShort(frames/info.sr) + ' a ' + info.sr + ' Hz'); }
-
-    var chans = [], k;
-    for(k=0;k<ch;k++) chans.push(buf.getChannelData(k));
-    var off = info.dataOffset;
-
-    // vistas rápidas quando o alinhamento permite; senão DataView
-    var i16 = null, f32 = null, i32 = null, f64 = null, u8 = null, dv = null;
-    if(tag === 1 && bits === 16 && off % 2 === 0) i16 = new Int16Array(ab, off, frames*ch);
-    else if(tag === 3 && bits === 32 && off % 4 === 0) f32 = new Float32Array(ab, off, frames*ch);
-    else if(tag === 1 && bits === 32 && off % 4 === 0) i32 = new Int32Array(ab, off, frames*ch);
-    else if(tag === 3 && bits === 64 && off % 8 === 0) f64 = new Float64Array(ab, off, frames*ch);
-    else if(tag === 1 && (bits === 24 || bits === 8)) u8 = new Uint8Array(ab, off, frames*frameSize);
-    else dv = new DataView(ab, off, frames*frameSize);
-
-    var pos = 0, SLICE = 300000;
-    function slice(){
-      var end = Math.min(frames, pos + SLICE), i, j, kk, base;
-      if(i16){
-        for(i=pos;i<end;i++){ base = i*ch; for(kk=0;kk<ch;kk++) chans[kk][i] = i16[base+kk] / 32768; }
-      } else if(f32){
-        for(i=pos;i<end;i++){ base = i*ch; for(kk=0;kk<ch;kk++) chans[kk][i] = f32[base+kk]; }
-      } else if(i32){
-        for(i=pos;i<end;i++){ base = i*ch; for(kk=0;kk<ch;kk++) chans[kk][i] = i32[base+kk] / 2147483648; }
-      } else if(f64){
-        for(i=pos;i<end;i++){ base = i*ch; for(kk=0;kk<ch;kk++) chans[kk][i] = f64[base+kk]; }
-      } else if(u8 && bits === 24){
-        for(i=pos;i<end;i++){
-          base = i*frameSize;
-          for(kk=0;kk<ch;kk++){ j = base + kk*3;
-            chans[kk][i] = (((u8[j] | (u8[j+1] << 8) | (u8[j+2] << 16)) << 8) >> 8) / 8388608;
-          }
-        }
-      } else if(u8){
-        for(i=pos;i<end;i++){ base = i*ch; for(kk=0;kk<ch;kk++) chans[kk][i] = (u8[base+kk] - 128) / 128; }
-      } else {
-        for(i=pos;i<end;i++){
-          base = i*frameSize;
-          for(kk=0;kk<ch;kk++){
-            j = base + kk*bps;
-            chans[kk][i] = tag === 3
-              ? (bits === 64 ? dv.getFloat64(j, true) : dv.getFloat32(j, true))
-              : (bits === 16 ? dv.getInt16(j, true) / 32768
-                : bits === 32 ? dv.getInt32(j, true) / 2147483648
-                : bits === 8 ? (dv.getUint8(j) - 128) / 128
-                : ((dv.getUint8(j) | (dv.getUint8(j+1) << 8) | (dv.getInt8(j+2) << 16))) / 8388608);
-          }
-        }
+  function parseChunk(out, id, cb){
+    var dv = new DataView(cb), u8 = new Uint8Array(cb), i;
+    if(id === 'ds64' && cb.byteLength >= 24){
+      // tamanhos de 64 bit para ficheiros acima de 4 GB
+      out.ds64Data = dv.getUint32(16, true) + dv.getUint32(20, true) * 4294967296;
+    } else if(id === 'fmt ' && cb.byteLength >= 16){
+      out.fmtTag = dv.getUint16(0, true);
+      out.channels = dv.getUint16(2, true);
+      out.sr = dv.getUint32(4, true);
+      out.bits = dv.getUint16(14, true);
+      if(out.fmtTag === 0xFFFE && cb.byteLength >= 26) out.fmtTag = dv.getUint16(24, true);
+    } else if(id === 'cue ' && cb.byteLength >= 4){
+      var n = dv.getUint32(0, true);
+      for(i=0;i<n;i++){
+        var o = 4 + i*24;
+        if(o + 24 > cb.byteLength) break;
+        out.cues.push({ id: dv.getUint32(o, true), sample: dv.getUint32(o+20, true) || dv.getUint32(o+4, true) });
       }
-      pos = end;
-      if(pos < frames){
-        if(onProgress) onProgress(pos/frames);
-        setTimeout(slice, 0);
-      } else {
-        done(null, buf);
+    } else if(id === 'LIST' && cb.byteLength >= 4 && tag4(u8, 0) === 'adtl'){
+      var q = 4, end = cb.byteLength;
+      while(q + 8 <= end){
+        var sid = tag4(u8, q), ssize = dv.getUint32(q+4, true), sbody = q + 8;
+        if(sbody + ssize > end) ssize = end - sbody;
+        if((sid === 'labl' || sid === 'note') && ssize >= 4){
+          var cid = dv.getUint32(sbody, true);
+          var txt = decodeText(u8.subarray(sbody+4, sbody+ssize));
+          if(txt && (sid === 'labl' || !out.labels[cid])) out.labels[cid] = txt;
+        } else if(sid === 'ltxt' && ssize >= 20){
+          var lid = dv.getUint32(sbody, true);
+          var slen = dv.getUint32(sbody+4, true);
+          if(slen > 0) out.lengths[lid] = slen;
+          var lt = decodeText(u8.subarray(sbody+20, sbody+ssize));
+          if(lt && !out.labels[lid]) out.labels[lid] = lt;
+        }
+        q = sbody + ssize + (ssize & 1);
       }
     }
-    slice();
   }
 
-  // ---------------------------------------------------------------- marker text import (Reaper CSV, Audacity labels, plain)
+  // ---------------------------------------------------------------- forma de onda lida por fatias
+  var TARGET_BUCKETS = 180000;
+  function buildPeaksFromFile(file, info, token){
+    var bps = info.bits >> 3, ch = info.channels, frameSize = bps * ch;
+    if(!frameSize || info.dataOffset == null || !info.dataSize) return;
+    if(info.fmtTag !== 1 && info.fmtTag !== 3){ hint('Forma de onda indisponível (áudio comprimido dentro do WAV)'); return; }
+    var frames = Math.floor(info.dataSize / frameSize);
+    if(frames < 1) return;
+
+    var fpb = Math.max(1, Math.ceil(frames / TARGET_BUCKETS));
+    var n = Math.ceil(frames / fpb);
+    var pk = new Float32Array(n), rms = new Float32Array(n);
+    state.peaks = { pk: pk, rms: rms, n: n, fpb: fpb, filled: 0, sr: info.sr };
+
+    var SLICE_BYTES = 8 * 1024 * 1024;
+    var bucketsPerSlice = Math.max(1, Math.floor(SLICE_BYTES / (fpb * frameSize)));
+    var stride = Math.max(1, Math.floor(fpb / 24));   // amostras por bucket, suficiente para o desenho
+    var b0 = 0;
+
+    function nextSlice(){
+      if(token !== state.scanToken) return;
+      if(b0 >= n){ hint(); draw(); return; }
+      var bEnd = Math.min(n, b0 + bucketsPerSlice);
+      var byteA = info.dataOffset + b0 * fpb * frameSize;
+      var byteB = Math.min(info.dataOffset + info.dataSize, info.dataOffset + bEnd * fpb * frameSize);
+      slice(file, byteA, byteB).then(function(buf){
+        if(token !== state.scanToken) return;
+        fillBuckets(buf, info, pk, rms, b0, bEnd, fpb, frameSize, stride, frames);
+        state.peaks.filled = bEnd;
+        b0 = bEnd;
+        hint('Forma de onda ' + Math.round(100*bEnd/n) + '%');
+        draw();
+        setTimeout(nextSlice, 0);
+      })['catch'](function(){ hint('Não consegui ler o ficheiro todo para a forma de onda.'); });
+    }
+    nextSlice();
+  }
+
+  function fillBuckets(buf, info, pk, rms, b0, bEnd, fpb, frameSize, stride, totalFrames){
+    var bits = info.bits, tag = info.fmtTag, ch = info.channels, bps = bits >> 3;
+    var u8 = new Uint8Array(buf), dv = new DataView(buf);
+    var i16 = null, f32 = null, i32 = null;
+    if(tag === 1 && bits === 16) i16 = new Int16Array(buf, 0, Math.floor(buf.byteLength/2));
+    else if(tag === 3 && bits === 32) f32 = new Float32Array(buf, 0, Math.floor(buf.byteLength/4));
+    else if(tag === 1 && bits === 32) i32 = new Int32Array(buf, 0, Math.floor(buf.byteLength/4));
+
+    for(var b=b0; b<bEnd; b++){
+      var f0 = b*fpb, f1 = Math.min(totalFrames, f0 + fpb);
+      var peak = 0, sum = 0, cnt = 0;
+      for(var f=f0; f<f1; f+=stride){
+        var local = (f - b0*fpb);
+        for(var k=0;k<ch;k++){
+          var v = 0, idx;
+          if(i16){ idx = local*ch + k; if(idx < i16.length) v = i16[idx] / 32768; }
+          else if(f32){ idx = local*ch + k; if(idx < f32.length) v = f32[idx]; }
+          else if(i32){ idx = local*ch + k; if(idx < i32.length) v = i32[idx] / 2147483648; }
+          else {
+            var j = local*frameSize + k*bps;
+            if(j + bps > u8.length) continue;
+            if(bits === 24) v = ((((u8[j] | (u8[j+1] << 8) | (u8[j+2] << 16)) << 8) >> 8)) / 8388608;
+            else if(bits === 8) v = (u8[j] - 128) / 128;
+            else if(tag === 3 && bits === 64) v = dv.getFloat64(j, true);
+            else if(bits === 16) v = dv.getInt16(j, true) / 32768;
+            else v = 0;
+          }
+          sum += v*v; cnt++;
+          if(v < 0) v = -v;
+          if(v > peak) peak = v;
+        }
+      }
+      pk[b] = peak > 1 ? 1 : peak;
+      rms[b] = cnt ? Math.min(1, Math.sqrt(sum/cnt)) : 0;
+    }
+  }
+
+  // forma de onda de formatos comprimidos (MP3, M4A…): só vale a pena em ficheiros pequenos
+  function buildPeaksFromDecoded(file, token){
+    var LIMIT = 120 * 1024 * 1024;
+    if(file.size > LIMIT){ hint('Forma de onda indisponível neste formato acima de ' + mb(LIMIT) + '.'); return; }
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if(!AC){ hint(); return; }
+    hint('A analisar a forma de onda…');
+    file.arrayBuffer().then(function(ab){
+      if(token !== state.scanToken) return;
+      var c = new AC();
+      var ok = function(buffer){
+        if(token !== state.scanToken){ try{ c.close(); }catch(e){} return; }
+        var frames = buffer.length, chs = [], k;
+        for(k=0;k<buffer.numberOfChannels;k++) chs.push(buffer.getChannelData(k));
+        var fpb = Math.max(1, Math.ceil(frames / TARGET_BUCKETS));
+        var n = Math.ceil(frames / fpb);
+        var pk = new Float32Array(n), rms = new Float32Array(n);
+        var stride = Math.max(1, Math.floor(fpb / 24));
+        for(var b=0;b<n;b++){
+          var f0=b*fpb, f1=Math.min(frames,f0+fpb), peak=0, sum=0, cnt=0;
+          for(var f=f0; f<f1; f+=stride) for(k=0;k<chs.length;k++){ var v=chs[k][f]; sum+=v*v; cnt++; if(v<0) v=-v; if(v>peak) peak=v; }
+          pk[b] = peak > 1 ? 1 : peak;
+          rms[b] = cnt ? Math.min(1, Math.sqrt(sum/cnt)) : 0;
+        }
+        state.peaks = { pk:pk, rms:rms, n:n, fpb:fpb, filled:n, sr: buffer.sampleRate };
+        state.sr = state.sr || buffer.sampleRate;
+        state.channels = state.channels || buffer.numberOfChannels;
+        renderMeta(); hint(); draw();
+        try{ c.close(); }catch(e){}
+      };
+      var no = function(){ hint('Sem forma de onda: o browser não descodificou este formato.'); try{ c.close(); }catch(e){} };
+      try{
+        var p = c.decodeAudioData(ab, ok, no);
+        if(p && p.then) p.then(ok)['catch'](no);
+      }catch(e){ no(); }
+    })['catch'](function(){ hint('Não consegui ler o ficheiro para a forma de onda.'); });
+  }
+
+  var _pr = [0, 0];
+  function peakAt(t0, t1){
+    var p = state.peaks;
+    _pr[0] = 0; _pr[1] = 0;
+    if(!p || !p.sr || !p.filled) return _pr;
+    var b0 = Math.floor(t0 * p.sr / p.fpb), b1 = Math.ceil(t1 * p.sr / p.fpb);
+    if(b1 <= b0) b1 = b0 + 1;
+    b0 = Math.max(0, Math.min(p.filled - 1, b0));
+    b1 = Math.max(b0 + 1, Math.min(p.filled, b1));
+    var m = 0, r = 0;
+    for(var i=b0;i<b1;i++){ if(p.pk[i] > m) m = p.pk[i]; if(p.rms[i] > r) r = p.rms[i]; }
+    _pr[0] = m; _pr[1] = r;
+    return _pr;
+  }
+
+  // ---------------------------------------------------------------- drawing
+  var RULER = 22, FLAG = 18;
+  function css(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+  var theme = {};
+  function readTheme(){
+    theme = {
+      surface: css('--surface'), surface2: css('--surface-2'), line: css('--line'),
+      ink: css('--ink'), muted: css('--muted'), wave: css('--wave'), waveSoft: css('--wave-soft'),
+      marker: css('--marker'), markerSoft: css('--marker-soft'), play: css('--play'), grid: css('--grid')
+    };
+  }
+  function niceStep(span, target){
+    var steps = [0.05,0.1,0.25,0.5,1,2,5,10,15,30,60,120,300,600,900,1800,3600];
+    for(var i=0;i<steps.length;i++) if(span/steps[i] <= target) return steps[i];
+    return steps[steps.length-1];
+  }
+  function draw(){
+    var w = cv.clientWidth, h = cv.clientHeight;
+    if(!w || !h) return;
+    var dpr = Math.min(2.5, window.devicePixelRatio || 1);
+    if(cv.width !== Math.round(w*dpr) || cv.height !== Math.round(h*dpr)){
+      cv.width = Math.round(w*dpr); cv.height = Math.round(h*dpr);
+    }
+    g.setTransform(dpr,0,0,dpr,0,0);
+    g.clearRect(0,0,w,h);
+
+    var a = state.view.a, b = state.view.b, span = b - a;
+    if(!(span > 0)) span = 1;
+    var wavTop = RULER, wavH = h - RULER, mid = wavTop + wavH/2;
+
+    g.fillStyle = theme.surface2; g.fillRect(0,0,w,RULER);
+    g.fillStyle = theme.line; g.fillRect(0,RULER-1,w,1);
+
+    var stp = niceStep(span, Math.max(3, Math.floor(w/88)));
+    g.font = '10.5px "IBM Plex Mono", monospace';
+    g.textBaseline = 'middle';
+    var t0 = Math.ceil(a/stp)*stp;
+    for(var t=t0; t<=b+1e-9; t+=stp){
+      var x = Math.round(((t-a)/span)*w) + 0.5;
+      g.fillStyle = theme.grid; g.fillRect(x,RULER,1,wavH);
+      g.fillStyle = theme.muted;
+      g.fillText(stp < 1 ? fmt(t).replace(/(\.\d{2})\d$/,'$1') : fmtShort(t), x+4, RULER/2);
+    }
+
+    g.fillStyle = theme.markerSoft;
+    state.markers.forEach(function(m){
+      if(m.end == null || m.end <= a || m.t >= b) return;
+      var x1 = ((Math.max(a,m.t)-a)/span)*w, x2 = ((Math.min(b,m.end)-a)/span)*w;
+      g.globalAlpha = .34; g.fillRect(x1, wavTop, Math.max(1,x2-x1), wavH); g.globalAlpha = 1;
+    });
+
+    g.fillStyle = theme.line; g.fillRect(0, Math.round(mid)+0.5, w, 1);
+
+    if(state.peaks && state.peaks.filled){
+      var amp = (wavH/2) - 6, x2p, ta, tb, pr, hh;
+      g.fillStyle = theme.waveSoft;
+      for(x2p=0; x2p<w; x2p++){
+        ta = a + (x2p/w)*span; tb = a + ((x2p+1)/w)*span;
+        pr = peakAt(ta, tb);
+        if(pr[0] <= 0) continue;
+        hh = Math.max(1, pr[0]*amp*2);
+        g.fillRect(x2p, mid - hh/2, 1, hh);
+      }
+      g.fillStyle = theme.wave;
+      for(x2p=0; x2p<w; x2p++){
+        ta = a + (x2p/w)*span; tb = a + ((x2p+1)/w)*span;
+        pr = peakAt(ta, tb);
+        if(pr[1] <= 0) continue;
+        hh = Math.max(1, pr[1]*amp*2);
+        g.fillRect(x2p, mid - hh/2, 1, hh);
+      }
+    }
+
+    g.font = '600 10.5px "IBM Plex Sans", sans-serif';
+    state.markers.forEach(function(m, i){
+      if(m.t < a || m.t > b) return;
+      var x = Math.round(((m.t-a)/span)*w) + 0.5;
+      g.fillStyle = theme.marker;
+      g.fillRect(x, RULER, 1.5, wavH);
+      var label = String(i+1);
+      var tw = g.measureText(label).width;
+      var bw = Math.max(16, tw + 10);
+      var bx = Math.min(w - bw - 1, x - 0.5);
+      g.fillRect(bx, RULER, bw, FLAG - 4);
+      g.fillStyle = theme.surface;
+      g.textBaseline = 'middle';
+      g.fillText(label, bx + (bw - tw)/2, RULER + (FLAG-4)/2 + 0.5);
+    });
+
+    var ht = headTime();
+    if(ht >= a && ht <= b){
+      var hx = Math.round(((ht-a)/span)*w) + 0.5;
+      g.fillStyle = theme.play;
+      g.fillRect(hx, 0, 1.5, h);
+      g.beginPath(); g.moveTo(hx-5, 0); g.lineTo(hx+5, 0); g.lineTo(hx, 7); g.closePath(); g.fill();
+    }
+
+    $('tNow').textContent = fmt(ht);
+    $('tDur').textContent = '/ ' + fmt(state.dur);
+    highlightRow();
+  }
+
+  // ---------------------------------------------------------------- view
+  function fitView(){ state.view.a = 0; state.view.b = Math.max(0.001, state.dur); draw(); }
+  function zoom(factor, anchorT){
+    if(!state.dur) return;
+    var a = state.view.a, b = state.view.b, span = b - a;
+    var at = anchorT == null ? headTime() : anchorT;
+    if(at < a || at > b) at = a + span/2;
+    var ns = Math.max(0.05, Math.min(state.dur, span*factor));
+    var frac = span > 0 ? (at - a)/span : .5;
+    var na = at - ns*frac, nb = na + ns;
+    if(na < 0){ na = 0; nb = ns; }
+    if(nb > state.dur){ nb = state.dur; na = Math.max(0, nb - ns); }
+    state.view.a = na; state.view.b = nb;
+    draw();
+  }
+  function ensureVisible(t){
+    var a = state.view.a, b = state.view.b, span = b - a;
+    if(span >= state.dur - 1e-6) return;
+    if(t < a + span*0.08 || t > b - span*0.08){
+      var na = Math.max(0, Math.min(state.dur - span, t - span/2));
+      state.view.a = na; state.view.b = na + span;
+    }
+  }
+
+  // ---------------------------------------------------------------- markers
+  function sortMarkers(){ state.markers.sort(function(x,y){ return x.t - y.t; }); }
+  function currentIndex(){
+    var t = headTime(), idx = -1;
+    for(var i=0;i<state.markers.length;i++) if(state.markers[i].t <= t + 0.001) idx = i;
+    return idx;
+  }
+  function segment(){
+    var i = currentIndex();
+    if(i < 0) return null;
+    var m = state.markers[i];
+    var end = m.end != null ? m.end : (state.markers[i+1] ? state.markers[i+1].t : state.dur);
+    return { a:m.t, b:end };
+  }
+
+  var rowEls = [];
+  function renderList(){
+    var list = $('list');
+    list.textContent = '';
+    rowEls = [];
+    $('mCount').textContent = state.markers.length;
+    if(!state.markers.length){
+      var e = document.createElement('div');
+      e.className = 'empty';
+      e.innerHTML = 'Sem marcas neste ficheiro. Só o WAV transporta <em>cues</em> embebidos — MP3, M4A e afins não os guardam. No Reaper, confirma a opção de escrever os marcadores como cues nas definições do formato WAV ao fazer render. Em alternativa, exporta as marcas do Region/Marker Manager e abre o CSV aqui, ou carrega em <strong>+ Marca</strong>.';
+      list.appendChild(e);
+      return;
+    }
+    state.markers.forEach(function(m, i){
+      var row = document.createElement('div');
+      row.className = 'row';
+      var go = document.createElement('button');
+      go.className = 'go'; go.title = 'Ir para esta marca';
+      var idx = document.createElement('span'); idx.className = 'idx'; idx.textContent = i+1;
+      var tt = document.createElement('span'); tt.className = 't mono'; tt.textContent = fmt(m.t);
+      go.appendChild(idx); go.appendChild(tt);
+      if(m.end != null){
+        var ln = document.createElement('span'); ln.className = 'len mono';
+        ln.textContent = '▸ ' + fmt(m.end);
+        go.appendChild(ln);
+      }
+      go.addEventListener('click', function(){ seek(m.t); ensureVisible(m.t); draw(); });
+
+      var nm = document.createElement('input');
+      nm.className = 'nm'; nm.value = m.name; nm.id = 'nm-' + m.id;
+      nm.setAttribute('aria-label','Nome da marca ' + (i+1));
+      nm.addEventListener('input', function(){ m.name = nm.value; save(); });
+
+      var del = document.createElement('button');
+      del.className = 'del'; del.textContent = '✕'; del.setAttribute('aria-label','Apagar marca');
+      var armed = false, armTimer = 0;
+      del.addEventListener('click', function(){
+        if(!armed){
+          armed = true; del.classList.add('arm'); del.textContent = 'Apagar?';
+          armTimer = setTimeout(function(){ armed = false; del.classList.remove('arm'); del.textContent = '✕'; }, 2800);
+          return;
+        }
+        clearTimeout(armTimer);
+        state.markers = state.markers.filter(function(x){ return x.id !== m.id; });
+        save(); renderList(); draw();
+      });
+
+      row.appendChild(go); row.appendChild(nm); row.appendChild(del);
+      list.appendChild(row);
+      rowEls.push(row);
+    });
+  }
+  function highlightRow(){
+    var i = currentIndex();
+    for(var k=0;k<rowEls.length;k++) rowEls[k].classList.toggle('active', k === i);
+  }
+
+  // ---------------------------------------------------------------- import de marcas em texto
   function parseTime(str){
     if(str == null) return null;
     var s = String(str).trim().replace(',', '.');
@@ -560,7 +803,6 @@
         if(endI >= 0) e = parseTime(c[endI]);
         nm = nameI >= 0 ? (c[nameI] || '') : '';
       } else {
-        // sniff: first numeric-time cell is the start; the last non-time cell is the name
         for(var i=0;i<c.length;i++){
           var v = parseTime(c[i]);
           if(v !== null){ if(t === null){ t = v; } else if(e === null){ e = v; } }
@@ -574,254 +816,9 @@
     return res;
   }
 
-  // ---------------------------------------------------------------- peaks
-  function buildPeaks(){
-    var chans = state.chans, len = chans[0] ? chans[0].length : 0;
-    var targetBuckets = 240000;
-    var bucket = Math.max(1, Math.floor(len / targetBuckets));
-    var n = Math.max(1, Math.ceil(len / bucket));
-    var mn = new Float32Array(n), mx = new Float32Array(n);
-    var step = Math.max(1, Math.ceil(bucket / 20));
-    for(var b=0;b<n;b++){
-      var s = b*bucket, e = Math.min(len, s+bucket), lo = 1, hi = -1;
-      for(var c=0;c<chans.length;c++){
-        var d = chans[c];
-        for(var i=s;i<e;i+=step){ var v = d[i]; if(v<lo) lo=v; if(v>hi) hi=v; }
-      }
-      if(hi < lo){ lo = 0; hi = 0; }
-      mn[b] = lo; mx[b] = hi;
-    }
-    state.peaks = { min:mn, max:mx, bucket:bucket, n:n };
-  }
-  function rangePeak(s0, s1){
-    var p = state.peaks, len = state.chans[0] ? state.chans[0].length : 0;
-    s0 = Math.max(0, Math.min(len-1, s0|0)); s1 = Math.max(s0+1, Math.min(len, s1|0));
-    var lo = 1, hi = -1, i, c;
-    if(!p || (s1 - s0) < p.bucket*2){
-      var step = Math.max(1, Math.floor((s1-s0)/512));
-      for(c=0;c<state.chans.length;c++){
-        var d = state.chans[c];
-        for(i=s0;i<s1;i+=step){ var v = d[i]; if(v<lo) lo=v; if(v>hi) hi=v; }
-      }
-    } else {
-      var b0 = Math.floor(s0/p.bucket), b1 = Math.min(p.n, Math.ceil(s1/p.bucket));
-      for(i=b0;i<b1;i++){ if(p.min[i]<lo) lo=p.min[i]; if(p.max[i]>hi) hi=p.max[i]; }
-    }
-    if(hi < lo){ lo = 0; hi = 0; }
-    return [lo, hi];
-  }
-
-  // ---------------------------------------------------------------- drawing
-  var RULER = 22, FLAG = 18;
-  function css(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
-  function niceStep(span, target){
-    var steps = [0.05,0.1,0.25,0.5,1,2,5,10,15,30,60,120,300,600,900,1800,3600];
-    for(var i=0;i<steps.length;i++) if(span/steps[i] <= target) return steps[i];
-    return steps[steps.length-1];
-  }
-  var theme = {};
-  function readTheme(){
-    theme = {
-      surface: css('--surface'), surface2: css('--surface-2'), line: css('--line'),
-      ink: css('--ink'), muted: css('--muted'), wave: css('--wave'), waveSoft: css('--wave-soft'),
-      marker: css('--marker'), markerSoft: css('--marker-soft'), play: css('--play'), grid: css('--grid')
-    };
-  }
-  function draw(){
-    var w = cv.clientWidth, h = cv.clientHeight;
-    if(!w || !h) return;
-    var dpr = Math.min(2.5, window.devicePixelRatio || 1);
-    if(cv.width !== Math.round(w*dpr) || cv.height !== Math.round(h*dpr)){
-      cv.width = Math.round(w*dpr); cv.height = Math.round(h*dpr);
-    }
-    g.setTransform(dpr,0,0,dpr,0,0);
-    g.clearRect(0,0,w,h);
-
-    var a = state.view.a, b = state.view.b, span = b - a;
-    var wavTop = RULER, wavH = h - RULER, mid = wavTop + wavH/2;
-
-    // ruler band
-    g.fillStyle = theme.surface2; g.fillRect(0,0,w,RULER);
-    g.fillStyle = theme.line; g.fillRect(0,RULER-1,w,1);
-
-    // grid + labels
-    var stp = niceStep(span, Math.max(3, Math.floor(w/88)));
-    g.font = '10.5px "IBM Plex Mono", monospace';
-    g.textBaseline = 'middle';
-    var t0 = Math.ceil(a/stp)*stp;
-    for(var t=t0; t<=b+1e-9; t+=stp){
-      var x = Math.round(((t-a)/span)*w) + 0.5;
-      g.fillStyle = theme.grid; g.fillRect(x,RULER,1,wavH);
-      g.fillStyle = theme.muted;
-      g.fillText(stp < 1 ? fmt(t).replace(/(\.\d{2})\d$/,'$1') : fmtShort(t), x+4, RULER/2);
-    }
-
-    // regions behind the wave
-    g.fillStyle = theme.markerSoft;
-    state.markers.forEach(function(m){
-      if(m.end == null || m.end <= a || m.t >= b) return;
-      var x1 = ((Math.max(a,m.t)-a)/span)*w, x2 = ((Math.min(b,m.end)-a)/span)*w;
-      g.globalAlpha = .34; g.fillRect(x1, wavTop, Math.max(1,x2-x1), wavH); g.globalAlpha = 1;
-    });
-
-    // centre line
-    g.fillStyle = theme.line; g.fillRect(0, Math.round(mid)+0.5, w, 1);
-
-    // waveform
-    if(state.chans.length && state.dur > 0){
-      var sr = state.sr, amp = (wavH/2) - 6;
-      g.fillStyle = theme.wave;
-      for(var x2p=0; x2p<w; x2p++){
-        var ta = a + (x2p/w)*span, tb = a + ((x2p+1)/w)*span;
-        var pr = rangePeak(ta*sr, tb*sr);
-        var yTop = mid - pr[1]*amp, yBot = mid - pr[0]*amp;
-        var hh = Math.max(1, yBot - yTop);
-        g.fillRect(x2p, yTop, 1, hh);
-      }
-    }
-
-    // markers
-    g.font = '600 10.5px "IBM Plex Sans", sans-serif';
-    state.markers.forEach(function(m, i){
-      if(m.t < a || m.t > b) return;
-      var x = Math.round(((m.t-a)/span)*w) + 0.5;
-      g.fillStyle = theme.marker;
-      g.fillRect(x, RULER, 1.5, wavH);
-      // flag
-      var label = String(i+1);
-      var tw = g.measureText(label).width;
-      var bw = Math.max(16, tw + 10);
-      var bx = Math.min(w - bw - 1, x - 0.5);
-      g.fillRect(bx, RULER, bw, FLAG - 4);
-      g.fillStyle = theme.surface;
-      g.textBaseline = 'middle';
-      g.fillText(label, bx + (bw - tw)/2, RULER + (FLAG-4)/2 + 0.5);
-    });
-
-    // playhead
-    var ht = headTime();
-    if(ht >= a && ht <= b){
-      var hx = Math.round(((ht-a)/span)*w) + 0.5;
-      g.fillStyle = theme.play;
-      g.fillRect(hx, 0, 1.5, h);
-      g.beginPath(); g.moveTo(hx-5, 0); g.lineTo(hx+5, 0); g.lineTo(hx, 7); g.closePath(); g.fill();
-    }
-
-    $('tNow').textContent = fmt(ht);
-    highlightRow();
-  }
-
-  // ---------------------------------------------------------------- view control
-  function fitView(){ state.view.a = 0; state.view.b = Math.max(0.001, state.dur); draw(); }
-  function zoom(factor, anchorT){
-    if(!state.dur) return;
-    var a = state.view.a, b = state.view.b, span = b - a;
-    var at = anchorT == null ? headTime() : anchorT;
-    if(at < a || at > b) at = a + span/2;
-    var ns = Math.max(0.05, Math.min(state.dur, span*factor));
-    var frac = span > 0 ? (at - a)/span : .5;
-    var na = at - ns*frac, nb = na + ns;
-    if(na < 0){ na = 0; nb = ns; }
-    if(nb > state.dur){ nb = state.dur; na = Math.max(0, nb - ns); }
-    state.view.a = na; state.view.b = nb;
-    draw();
-  }
-  function ensureVisible(t){
-    var a = state.view.a, b = state.view.b, span = b - a;
-    if(span >= state.dur - 1e-6) return;
-    if(t < a + span*0.08 || t > b - span*0.08){
-      var na = Math.max(0, Math.min(state.dur - span, t - span/2));
-      state.view.a = na; state.view.b = na + span;
-    }
-  }
-
-  // ---------------------------------------------------------------- markers model
-  function sortMarkers(){ state.markers.sort(function(x,y){ return x.t - y.t; }); }
-  function markerAt(dir){
-    var t = headTime(), eps = 0.02, m = null;
-    if(dir > 0){
-      for(var i=0;i<state.markers.length;i++) if(state.markers[i].t > t + eps){ m = state.markers[i]; break; }
-    } else {
-      for(var j=state.markers.length-1;j>=0;j--) if(state.markers[j].t < t - eps){ m = state.markers[j]; break; }
-    }
-    return m;
-  }
-  function currentIndex(){
-    var t = headTime(), idx = -1;
-    for(var i=0;i<state.markers.length;i++) if(state.markers[i].t <= t + 0.001) idx = i;
-    return idx;
-  }
-  function segment(){
-    var i = currentIndex();
-    if(i < 0) return null;
-    var m = state.markers[i];
-    var end = m.end != null ? m.end : (state.markers[i+1] ? state.markers[i+1].t : state.dur);
-    return { a:m.t, b:end };
-  }
-
-  var rowEls = [];
-  function renderList(){
-    var list = $('list');
-    list.textContent = '';
-    rowEls = [];
-    $('mCount').textContent = state.markers.length;
-    if(!state.markers.length){
-      var e = document.createElement('div');
-      e.className = 'empty';
-      e.innerHTML = 'Sem marcas neste ficheiro. Só o WAV transporta <em>cues</em> embebidos — MP3, M4A e afins não os guardam. No Reaper, confirma a opção de escrever os marcadores como cues nas definições do formato WAV ao fazer render. Em alternativa, exporta as marcas do Region/Marker Manager e abre o CSV aqui, ou carrega em <strong>+ Marca</strong>.';
-      list.appendChild(e);
-      return;
-    }
-    state.markers.forEach(function(m, i){
-      var row = document.createElement('div');
-      row.className = 'row';
-
-      var go = document.createElement('button');
-      go.className = 'go';
-      go.title = 'Ir para esta marca';
-      var idx = document.createElement('span'); idx.className = 'idx'; idx.textContent = i+1;
-      var tt = document.createElement('span'); tt.className = 't mono'; tt.textContent = fmt(m.t);
-      go.appendChild(idx); go.appendChild(tt);
-      if(m.end != null){
-        var ln = document.createElement('span'); ln.className = 'len mono';
-        ln.textContent = '▸ ' + fmt(m.end);
-        go.appendChild(ln);
-      }
-      go.addEventListener('click', function(){ seek(m.t); ensureVisible(m.t); draw(); });
-
-      var nm = document.createElement('input');
-      nm.className = 'nm'; nm.value = m.name; nm.setAttribute('aria-label','Nome da marca ' + (i+1));
-      nm.id = 'nm-' + m.id;
-      nm.addEventListener('input', function(){ m.name = nm.value; save(); });
-
-      var del = document.createElement('button');
-      del.className = 'del'; del.textContent = '✕'; del.setAttribute('aria-label','Apagar marca');
-      var armed = false, armTimer = 0;
-      del.addEventListener('click', function(){
-        if(!armed){
-          armed = true; del.classList.add('arm'); del.textContent = 'Apagar?';
-          armTimer = setTimeout(function(){ armed = false; del.classList.remove('arm'); del.textContent = '✕'; }, 2800);
-          return;
-        }
-        clearTimeout(armTimer);
-        state.markers = state.markers.filter(function(x){ return x.id !== m.id; });
-        save(); renderList(); draw();
-      });
-
-      row.appendChild(go); row.appendChild(nm); row.appendChild(del);
-      list.appendChild(row);
-      rowEls.push(row);
-    });
-  }
-
-  function highlightRow(){
-    var i = currentIndex();
-    for(var k=0;k<rowEls.length;k++) rowEls[k].classList.toggle('active', k === i);
-  }
-
-  // ---------------------------------------------------------------- storage (per-viewer convenience)
+  // ---------------------------------------------------------------- storage
   function storeKey(){
-    if(state.isDemo) return null;
+    if(state.isDemo || !state.dur) return null;
     return 'mwav:' + state.name + ':' + Math.round(state.dur*1000);
   }
   function save(){
@@ -855,117 +852,83 @@
     }
     var bits = [];
     bits.push(fmt(state.dur));
-    bits.push((state.sr/1000).toFixed(state.sr % 1000 ? 1 : 0) + ' kHz');
-    bits.push(state.channels === 1 ? 'mono' : state.channels === 2 ? 'estéreo' : state.channels + ' canais');
+    if(state.sr) bits.push((state.sr/1000).toFixed(state.sr % 1000 ? 1 : 0) + ' kHz');
+    if(state.channels) bits.push(state.channels === 1 ? 'mono' : state.channels === 2 ? 'estéreo' : state.channels + ' canais');
     if(state.bits) bits.push(state.bits + ' bit');
+    if(state.size) bits.push(mb(state.size));
     var s = document.createElement('span'); s.className = 'mono'; s.textContent = bits.join('  ·  ');
     el.appendChild(s);
   }
 
-  // ---------------------------------------------------------------- loading a file
-  function adoptBuffer(buf){
-    state.buffer = buf;
-    state.sr = buf.sampleRate;
-    state.dur = buf.duration;
-    state.channels = buf.numberOfChannels;
-    state.chans = [];
-    for(var c=0;c<buf.numberOfChannels;c++) state.chans.push(buf.getChannelData(c));
-    buildPeaks();
-    state.head = 0;
-    $('tDur').textContent = '/ ' + fmt(state.dur);
-    fitView();
-  }
+  // ---------------------------------------------------------------- abrir ficheiro
+  function openFile(file, isDemo){
+    var token = ++state.scanToken;
+    try{ audio.pause(); }catch(e){}
+    if(objUrl){ try{ URL.revokeObjectURL(objUrl); }catch(e){} }
+    objUrl = URL.createObjectURL(file);
 
-  function openFile(file){
-    stopSource(); state.playing = false; syncPlayBtn();
-    busy(true, 'A ler o ficheiro…');
-    var readErr = function(e){
+    state.name = file.name; state.isDemo = !!isDemo; state.size = file.size;
+    state.sr = null; state.bits = null; state.channels = null;
+    state.peaks = null; state.dur = 0; state.markers = [];
+    renderMeta(); renderList(); hint(); draw();
+    busy(true, 'A abrir ' + mb(file.size) + '…');
+
+    var metaDone = false, scanDone = false, info = null;
+
+    function finish(){
+      if(!metaDone || !scanDone || token !== state.scanToken) return;
       busy(false);
-      var why = e && e.message ? ' (' + e.message + ')' : '';
-      toast('Não foi possível ler o ficheiro' + why + '. Ficheiros muito grandes podem não caber na memória do telemóvel.');
+      if(info){
+        state.sr = info.sr; state.bits = info.bits; state.channels = info.channels;
+        if(!isFinite(state.dur) || state.dur <= 0){
+          var fsz = (info.bits >> 3) * info.channels;
+          if(fsz) state.dur = Math.floor(info.dataSize / fsz) / info.sr;
+        }
+      }
+      var embedded = [];
+      if(info && info.cues.length){
+        var sr = info.sr || 48000;
+        info.cues.forEach(function(q, i){
+          var len = info.lengths[q.id];
+          embedded.push({ id: uid++, t: q.sample / sr,
+                          end: len ? (q.sample + len) / sr : null,
+                          name: info.labels[q.id] || ('Cue ' + (i+1)) });
+        });
+      }
+      var saved = load();
+      if(saved){ state.markers = saved; toast('Marcas guardadas neste dispositivo restauradas (' + saved.length + ').'); }
+      else {
+        state.markers = embedded;
+        if(embedded.length) toast(embedded.length + ' marca' + (embedded.length>1?'s':'') + ' lida' + (embedded.length>1?'s':'') + ' do ficheiro.');
+        else if(!isDemo) toast('Ficheiro aberto. Não traz cues embebidos — importa o CSV ou usa "+ Marca".', 5000);
+      }
+      sortMarkers(); renderMeta(); renderList(); fitView(); syncPlayBtn();
+
+      if(info) buildPeaksFromFile(file, info, token);
+      else buildPeaksFromDecoded(file, token);
+    }
+
+    audio.onloadedmetadata = function(){
+      if(token !== state.scanToken) return;
+      state.dur = isFinite(audio.duration) ? audio.duration : 0;
+      metaDone = true; finish();
     };
-    if(file.arrayBuffer){
-      file.arrayBuffer().then(gotBytes)['catch'](readErr);
-    } else {
-      var fr = new FileReader();
-      fr.onerror = function(){ readErr(fr.error); };
-      fr.onload = function(){ gotBytes(fr.result); };
-      fr.readAsArrayBuffer(file);
-    }
+    audio.onerror = function(){
+      if(token !== state.scanToken) return;
+      busy(false);
+      toast('O browser não conseguiu abrir este ficheiro de áudio.', 6000);
+      metaDone = true; finish();
+    };
+    audio.src = objUrl;
+    audio.load();
 
-    function gotBytes(ab){
-      var info = null;
-      try{ info = readCues(ab); }catch(e){ info = null; }
-      busy(true, 'A descodificar o áudio…');
-      var c = getCtx();
-      if(!c){ busy(false); toast('Este browser não suporta Web Audio.'); return; }
-      if(c.state === 'suspended') c.resume();
-      var settled = false;
-      var done = function(buf){
-        if(settled) return; settled = true;
-        state.name = file.name;
-        state.isDemo = false;
-        state.bits = info && info.bits ? info.bits : null;
-        adoptBuffer(buf);
-
-        var embedded = [];
-        if(info && info.cues.length){
-          var sr = info.sr || buf.sampleRate;
-          info.cues.forEach(function(q, i){
-            var len = info.lengths[q.id];
-            embedded.push({
-              id: uid++,
-              t: q.sample / sr,
-              end: len ? (q.sample + len) / sr : null,
-              name: info.labels[q.id] || ('Cue ' + (i+1))
-            });
-          });
-        }
-        var saved = load();
-        if(saved){
-          state.markers = saved;
-          toast('Marcas guardadas neste telemóvel restauradas (' + saved.length + ').');
-        } else {
-          state.markers = embedded;
-          if(embedded.length) toast(embedded.length + ' marca' + (embedded.length>1?'s':'') + ' lida' + (embedded.length>1?'s':'') + ' do ficheiro.');
-          else toast('O ficheiro não traz cues embebidos.');
-        }
-        sortMarkers(); renderMeta(); renderList(); busy(false); draw();
-      };
-      var ownErr = null;
-      var fail = function(e){
-        if(settled) return; settled = true;
-        busy(false);
-        var why = ownErr ? ' (' + ownErr + ')' : (e && e.message ? ' (' + e.message + ')' : '');
-        toast('Não consegui descodificar este áudio' + why + '.');
-      };
-      var browserDecode = function(){
-        try{
-          var p = c.decodeAudioData(ab, done, fail);
-          if(p && p.then) p.then(done)['catch'](fail);
-        }catch(e){ fail(e); }
-      };
-      if(!info){
-        // não é WAV (MP3, M4A, AIFF, FLAC…): descodifica o browser
-        browserDecode();
-        return;
-      }
-      // é WAV: o nosso descodificador trata de 24 bit, float e extensible,
-      // que são precisamente os que o browser costuma recusar
-      var label = (info.bits ? ' ' + info.bits + ' bit' : '') + (info.channels === 1 ? ' mono' : info.channels === 2 ? ' estéreo' : '');
-      busy(true, 'A descodificar' + label + '…');
-      try{
-        decodeWavPcm(ab, info,
-          function(frac){ busy(true, 'A descodificar' + label + '… ' + Math.round(frac*100) + '%'); },
-          function(err, buf){
-            if(err){ ownErr = err; browserDecode(); }
-            else done(buf);
-          });
-      }catch(e){
-        ownErr = e && e.message ? e.message : 'erro interno';
-        browserDecode();
-      }
-    }
+    scanWav(file).then(function(res){
+      if(token !== state.scanToken) return;
+      info = res; scanDone = true; finish();
+    })['catch'](function(){
+      if(token !== state.scanToken) return;
+      info = null; scanDone = true; finish();
+    });
   }
 
   function openMarkerFile(file){
@@ -982,14 +945,12 @@
     fr.readAsText(file);
   }
 
-  // ---------------------------------------------------------------- demo content
-  function makeDemo(){
-    var c = getCtx();
-    var sr = c ? c.sampleRate : 44100;
-    var dur = 16, len = Math.floor(sr*dur);
-    var data = new Float32Array(len);
+  // ---------------------------------------------------------------- exemplo (WAV real, com cues)
+  function demoFile(){
+    var sr = 44100, secs = 16, frames = sr*secs;
     var hits = [0.4, 3.2, 7.6, 12.1];
-    for(var i=0;i<len;i++){
+    var pcm = new Int16Array(frames);
+    for(var i=0;i<frames;i++){
       var t = i/sr;
       var bed = Math.sin(2*Math.PI*110*t) * 0.06 * (0.6 + 0.4*Math.sin(2*Math.PI*0.23*t));
       var env = 0;
@@ -999,29 +960,48 @@
       }
       var tone = Math.sin(2*Math.PI*(220 + 40*Math.sin(2*Math.PI*1.7*t))*t);
       var noise = (Math.random()*2-1) * 0.25;
-      data[i] = Math.max(-1, Math.min(1, bed + env*(tone*0.7 + noise)));
+      var v = bed + env*(tone*0.7 + noise);
+      pcm[i] = Math.max(-32767, Math.min(32767, Math.round(v*32767)));
     }
-    state.name = 'Exemplo — alinhamento de show';
-    state.isDemo = true;
-    state.bits = null;
-    if(c){
-      var buf = c.createBuffer(1, len, sr);
-      buf.copyToChannel ? buf.copyToChannel(data, 0) : buf.getChannelData(0).set(data);
-      adoptBuffer(buf);
-    } else {
-      state.buffer = null; state.sr = sr; state.dur = dur; state.channels = 1;
-      state.chans = [data]; buildPeaks(); fitView();
-    }
-    state.markers = [
-      { id: uid++, t:0.40, end:3.10, name:'Pré-show' },
-      { id: uid++, t:3.20, end:null, name:'Entrada banda' },
-      { id: uid++, t:7.60, end:12.00, name:'Solo — followspot' },
-      { id: uid++, t:12.10, end:null, name:'Blackout' }
-    ];
-    renderMeta(); renderList();
+    var names = ['Pré-show','Entrada banda','Solo — followspot','Blackout'];
+    var regions = [Math.round(2.7*sr), 0, Math.round(4.4*sr), 0];
+
+    // chunks
+    var enc = function(s){ var b = []; for(var i=0;i<s.length;i++){ var c = s.charCodeAt(i);
+      if(c < 128) b.push(c); else if(c < 2048){ b.push(192|c>>6, 128|c&63); } else { b.push(224|c>>12, 128|(c>>6)&63, 128|c&63); } }
+      b.push(0); if(b.length & 1) b.push(0); return new Uint8Array(b); };
+    var labls = names.map(function(nm,i){ return { id:i+1, txt:enc(nm) }; });
+    var adtlLen = 4;
+    labls.forEach(function(l){ adtlLen += 8 + 4 + l.txt.length; });
+    regions.forEach(function(r,i){ if(r) adtlLen += 8 + 20; });
+
+    var cueLen = 4 + 24*hits.length;
+    var dataLen = pcm.length*2;
+    var total = 4 + (8+16) + (8+dataLen) + (8+cueLen) + (8+adtlLen);
+    var buf = new ArrayBuffer(8 + total);
+    var dv = new DataView(buf), u8 = new Uint8Array(buf), o = 0;
+    var W = function(s){ for(var i=0;i<s.length;i++) u8[o++] = s.charCodeAt(i); };
+    var U32 = function(v){ dv.setUint32(o, v, true); o += 4; };
+    var U16 = function(v){ dv.setUint16(o, v, true); o += 2; };
+    W('RIFF'); U32(total); W('WAVE');
+    W('fmt '); U32(16); U16(1); U16(1); U32(sr); U32(sr*2); U16(2); U16(16);
+    W('data'); U32(dataLen);
+    new Int16Array(buf, o, pcm.length).set(pcm); o += dataLen;
+    W('cue '); U32(cueLen); U32(hits.length);
+    hits.forEach(function(t,i){
+      var smp = Math.round(t*sr);
+      U32(i+1); U32(smp); W('data'); U32(0); U32(0); U32(smp);
+    });
+    W('LIST'); U32(adtlLen); W('adtl');
+    labls.forEach(function(l){ W('labl'); U32(4 + l.txt.length); U32(l.id); u8.set(l.txt, o); o += l.txt.length; });
+    regions.forEach(function(r,i){ if(!r) return; W('ltxt'); U32(20); U32(i+1); U32(r); W('rgn '); U16(0); U16(0); U16(0); U16(0); });
+
+    var blob = new Blob([buf], {type:'audio/wav'});
+    try{ return new File([blob], 'Exemplo — alinhamento de show.wav', {type:'audio/wav'}); }
+    catch(e){ blob.name = 'Exemplo — alinhamento de show.wav'; return blob; }
   }
 
-  // ---------------------------------------------------------------- pointer on canvas
+  // ---------------------------------------------------------------- pointer
   var drag = null;
   function timeAtX(x){
     var w = cv.clientWidth || 1;
@@ -1030,7 +1010,7 @@
   cv.addEventListener('pointerdown', function(ev){
     cv.setPointerCapture(ev.pointerId);
     var r = cv.getBoundingClientRect();
-    drag = { x0: ev.clientX - r.left, y0: ev.clientY - r.top, a0: state.view.a, b0: state.view.b, moved:false, t0: Date.now() };
+    drag = { x0: ev.clientX - r.left, a0: state.view.a, b0: state.view.b, moved:false, t0: Date.now() };
   });
   cv.addEventListener('pointermove', function(ev){
     if(!drag) return;
@@ -1039,18 +1019,16 @@
     if(Math.abs(dx) > 7) drag.moved = true;
     if(!drag.moved) return;
     var w = cv.clientWidth || 1, span = drag.b0 - drag.a0;
-    var shift = -(dx/w)*span;
-    var na = Math.max(0, Math.min(state.dur - span, drag.a0 + shift));
+    var na = Math.max(0, Math.min(Math.max(0, state.dur - span), drag.a0 - (dx/w)*span));
     state.view.a = na; state.view.b = na + span;
     draw();
   });
-  function endDrag(ev){
+  cv.addEventListener('pointerup', function(ev){
     if(!drag) return;
     var r = cv.getBoundingClientRect();
     var x = ev.clientX - r.left;
     if(!drag.moved && Date.now() - drag.t0 < 700){
       var t = timeAtX(x);
-      // snap to a nearby marker flag
       var w = cv.clientWidth || 1, span = state.view.b - state.view.a, tol = (14/w)*span;
       var best = null, bd = tol;
       state.markers.forEach(function(m){
@@ -1060,8 +1038,7 @@
       seek(best ? best.t : t);
     }
     drag = null;
-  }
-  cv.addEventListener('pointerup', endDrag);
+  });
   cv.addEventListener('pointercancel', function(){ drag = null; });
   cv.addEventListener('wheel', function(ev){
     if(!state.dur) return;
@@ -1071,18 +1048,18 @@
   }, {passive:false});
 
   // ---------------------------------------------------------------- controls
-  $('pick').addEventListener('change', function(e){ if(e.target.files[0]) openFile(e.target.files[0]); e.target.value=''; });
+  $('pick').addEventListener('change', function(e){ if(e.target.files[0]) openFile(e.target.files[0], false); e.target.value=''; });
   $('pickCsv').addEventListener('change', function(e){ if(e.target.files[0]) openMarkerFile(e.target.files[0]); e.target.value=''; });
   $('play').addEventListener('click', toggle);
   $('prev').addEventListener('click', function(){
-    var t = headTime();
-    var cur = null;
+    var t = headTime(), cur = null;
     for(var i=0;i<state.markers.length;i++) if(state.markers[i].t <= t - 0.35) cur = state.markers[i];
     var target = cur ? cur.t : 0;
     seek(target); ensureVisible(target); draw();
   });
   $('next').addEventListener('click', function(){
-    var m = markerAt(1);
+    var t = headTime(), m = null;
+    for(var i=0;i<state.markers.length;i++) if(state.markers[i].t > t + 0.02){ m = state.markers[i]; break; }
     var target = m ? m.t : state.dur;
     seek(target); ensureVisible(target); draw();
   });
@@ -1118,9 +1095,8 @@
       try{ document.execCommand('copy'); ok(); }catch(e){ toast('Não consegui copiar neste browser.'); }
       ta.remove();
     };
-    if(navigator.clipboard && navigator.clipboard.writeText){
-      navigator.clipboard.writeText(txt).then(ok)['catch'](no);
-    } else no();
+    if(navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(ok)['catch'](no);
+    else no();
   });
 
   document.addEventListener('keydown', function(ev){
@@ -1131,36 +1107,35 @@
     else if(ev.key === 'm' || ev.key === 'M'){ $('addM').click(); }
   });
 
-  // ---------------------------------------------------------------- loop
+  // ---------------------------------------------------------------- loop de desenho
   var raf = 0;
   function tick(){
     cancelAnimationFrame(raf);
     var t = headTime();
-    if(state.loop && state.playing){
+    if(state.loop && isPlaying()){
       var s = segment();
-      if(s && t >= s.b - 0.005){ seek(s.a, true); }
+      if(s && t >= s.b - 0.02){ seek(s.a); t = s.a; }
     }
-    if(state.playing) ensureVisible(t);
+    if(isPlaying()) ensureVisible(t);
+    $('tDur').textContent = '/ ' + fmt(state.dur);
     draw();
-    if(state.playing) raf = requestAnimationFrame(tick);
+    if(isPlaying()) raf = requestAnimationFrame(tick);
   }
 
   // ---------------------------------------------------------------- boot
   readTheme();
+  $('ver').textContent = 'v' + VERSION;
   var mq = window.matchMedia('(prefers-color-scheme: dark)');
   if(mq.addEventListener) mq.addEventListener('change', function(){ readTheme(); draw(); });
   new MutationObserver(function(){ readTheme(); draw(); })
     .observe(document.documentElement, {attributes:true, attributeFilter:['data-theme']});
-
   var ro = new ResizeObserver(function(){ draw(); });
   ro.observe(cv);
   window.addEventListener('resize', function(){ readTheme(); draw(); });
+  setInterval(function(){ if(!isPlaying()) draw(); }, 400);
 
-  try{ getCtx(); }catch(e){}
-  makeDemo();
-  $('tDur').textContent = '/ ' + fmt(state.dur);
   syncPlayBtn();
-  draw();
+  openFile(demoFile(), true);
 })();
 </script>
 
