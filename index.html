@@ -208,8 +208,8 @@
 <div id="app">
   <div class="top">
     <div class="brand"><b>Marcador WAV</b><span>cues &amp; playback</span></div>
-    <label class="btn primary" for="pick">Abrir WAV</label>
-    <input id="pick" type="file" accept=".wav,.wave,audio/wav,audio/x-wav,audio/*" hidden>
+    <label class="btn primary" for="pick">Abrir áudio</label>
+    <input id="pick" type="file" accept="audio/*,.wav,.wave,.mp3,.m4a,.aac,.aif,.aiff,.flac,.ogg,.opus,.caf" hidden>
     <label class="btn" for="pickCsv">Marcas (CSV)</label>
     <input id="pickCsv" type="file" accept=".csv,.txt,text/csv,text/plain" hidden>
   </div>
@@ -436,57 +436,84 @@
   // ---------------------------------------------------------------- descodificador WAV próprio (PCM e float)
   // O descodificador do browser recusa alguns WAV (24 bit, extensible, chunks extra).
   // Como já lemos os chunks, convertemos as amostras nós próprios — resultado previsível.
-  function decodeWavPcm(ab, info){
-    if(!info || info.dataOffset == null || !info.dataSize) return { err:'sem chunk data' };
-    if(!info.sr || !info.channels || !info.bits) return { err:'sem chunk fmt' };
+  // Descodifica por fatias, cedendo o fio ao ecrã entre elas: num ficheiro de 6 min
+  // a 24 bit são ~35 milhões de amostras, e de uma só vez o telemóvel dava o ar por perdido.
+  // done(erro, buffer); onProgress(0..1)
+  function decodeWavPcm(ab, info, onProgress, done){
+    if(!info || info.dataOffset == null || !info.dataSize) return done('sem chunk data');
+    if(!info.sr || !info.channels || !info.bits) return done('sem chunk fmt');
     var tag = info.fmtTag;
-    if(tag !== 1 && tag !== 3) return { err:'formato comprimido (código ' + tag + ')' };
+    if(tag !== 1 && tag !== 3) return done('formato comprimido (código ' + tag + ')');
     var c = getCtx();
-    if(!c) return { err:'sem Web Audio' };
+    if(!c) return done('sem Web Audio');
 
     var ch = info.channels, bits = info.bits, bps = bits >> 3;
-    if(bps < 1 || bps > 8) return { err:bits + ' bit não suportado' };
+    if(bps < 1 || bps > 8) return done(bits + ' bit não suportado');
     var frameSize = bps * ch;
-    var frames = Math.floor(Math.min(info.dataSize, ab.byteLength - info.dataOffset) / frameSize);
-    if(frames < 1) return { err:'sem amostras' };
+    var avail = Math.min(info.dataSize, ab.byteLength - info.dataOffset);
+    var frames = Math.floor(avail / frameSize);
+    if(frames < 1) return done('sem amostras');
 
     var buf;
     try{ buf = c.createBuffer(ch, frames, info.sr); }
-    catch(e){ return { err:'memória insuficiente para ' + (frames/info.sr/60).toFixed(1) + ' min a ' + info.sr + ' Hz' }; }
+    catch(e){ return done('memória insuficiente para ' + fmtShort(frames/info.sr) + ' a ' + info.sr + ' Hz'); }
 
     var chans = [], k;
     for(k=0;k<ch;k++) chans.push(buf.getChannelData(k));
-    var off = info.dataOffset, i, j, v;
+    var off = info.dataOffset;
 
-    if(tag === 1 && bits === 16 && off % 2 === 0){
-      var i16 = new Int16Array(ab, off, frames*ch);
-      for(i=0;i<frames;i++) for(k=0;k<ch;k++) chans[k][i] = i16[i*ch+k] / 32768;
-    } else if(tag === 3 && bits === 32 && off % 4 === 0){
-      var f32 = new Float32Array(ab, off, frames*ch);
-      for(i=0;i<frames;i++) for(k=0;k<ch;k++) chans[k][i] = f32[i*ch+k];
-    } else {
-      var dv = new DataView(ab, off, frames*frameSize);
-      for(i=0;i<frames;i++){
-        for(k=0;k<ch;k++){
-          j = i*frameSize + k*bps;
-          if(tag === 3){
-            v = bits === 64 ? dv.getFloat64(j, true) : dv.getFloat32(j, true);
-          } else if(bits === 8){
-            v = (dv.getUint8(j) - 128) / 128;
-          } else if(bits === 16){
-            v = dv.getInt16(j, true) / 32768;
-          } else if(bits === 24){
-            v = ((dv.getUint8(j) | (dv.getUint8(j+1) << 8) | (dv.getInt8(j+2) << 16))) / 8388608;
-          } else if(bits === 32){
-            v = dv.getInt32(j, true) / 2147483648;
-          } else {
-            v = 0;
+    // vistas rápidas quando o alinhamento permite; senão DataView
+    var i16 = null, f32 = null, i32 = null, f64 = null, u8 = null, dv = null;
+    if(tag === 1 && bits === 16 && off % 2 === 0) i16 = new Int16Array(ab, off, frames*ch);
+    else if(tag === 3 && bits === 32 && off % 4 === 0) f32 = new Float32Array(ab, off, frames*ch);
+    else if(tag === 1 && bits === 32 && off % 4 === 0) i32 = new Int32Array(ab, off, frames*ch);
+    else if(tag === 3 && bits === 64 && off % 8 === 0) f64 = new Float64Array(ab, off, frames*ch);
+    else if(tag === 1 && (bits === 24 || bits === 8)) u8 = new Uint8Array(ab, off, frames*frameSize);
+    else dv = new DataView(ab, off, frames*frameSize);
+
+    var pos = 0, SLICE = 300000;
+    function slice(){
+      var end = Math.min(frames, pos + SLICE), i, j, kk, base;
+      if(i16){
+        for(i=pos;i<end;i++){ base = i*ch; for(kk=0;kk<ch;kk++) chans[kk][i] = i16[base+kk] / 32768; }
+      } else if(f32){
+        for(i=pos;i<end;i++){ base = i*ch; for(kk=0;kk<ch;kk++) chans[kk][i] = f32[base+kk]; }
+      } else if(i32){
+        for(i=pos;i<end;i++){ base = i*ch; for(kk=0;kk<ch;kk++) chans[kk][i] = i32[base+kk] / 2147483648; }
+      } else if(f64){
+        for(i=pos;i<end;i++){ base = i*ch; for(kk=0;kk<ch;kk++) chans[kk][i] = f64[base+kk]; }
+      } else if(u8 && bits === 24){
+        for(i=pos;i<end;i++){
+          base = i*frameSize;
+          for(kk=0;kk<ch;kk++){ j = base + kk*3;
+            chans[kk][i] = (((u8[j] | (u8[j+1] << 8) | (u8[j+2] << 16)) << 8) >> 8) / 8388608;
           }
-          chans[k][i] = v;
+        }
+      } else if(u8){
+        for(i=pos;i<end;i++){ base = i*ch; for(kk=0;kk<ch;kk++) chans[kk][i] = (u8[base+kk] - 128) / 128; }
+      } else {
+        for(i=pos;i<end;i++){
+          base = i*frameSize;
+          for(kk=0;kk<ch;kk++){
+            j = base + kk*bps;
+            chans[kk][i] = tag === 3
+              ? (bits === 64 ? dv.getFloat64(j, true) : dv.getFloat32(j, true))
+              : (bits === 16 ? dv.getInt16(j, true) / 32768
+                : bits === 32 ? dv.getInt32(j, true) / 2147483648
+                : bits === 8 ? (dv.getUint8(j) - 128) / 128
+                : ((dv.getUint8(j) | (dv.getUint8(j+1) << 8) | (dv.getInt8(j+2) << 16))) / 8388608);
+          }
         }
       }
+      pos = end;
+      if(pos < frames){
+        if(onProgress) onProgress(pos/frames);
+        setTimeout(slice, 0);
+      } else {
+        done(null, buf);
+      }
     }
-    return { buffer: buf };
+    slice();
   }
 
   // ---------------------------------------------------------------- marker text import (Reaper CSV, Audacity labels, plain)
@@ -554,7 +581,7 @@
     var bucket = Math.max(1, Math.floor(len / targetBuckets));
     var n = Math.max(1, Math.ceil(len / bucket));
     var mn = new Float32Array(n), mx = new Float32Array(n);
-    var step = Math.max(1, Math.floor(bucket / 48));
+    var step = Math.max(1, Math.ceil(bucket / 20));
     for(var b=0;b<n;b++){
       var s = b*bucket, e = Math.min(len, s+bucket), lo = 1, hi = -1;
       for(var c=0;c<chans.length;c++){
@@ -741,7 +768,7 @@
     if(!state.markers.length){
       var e = document.createElement('div');
       e.className = 'empty';
-      e.innerHTML = 'Sem marcas neste ficheiro. O Reaper escreve as marcas do projeto no WAV como <em>cues</em> — confirma essa opção nas definições do formato WAV ao fazer render. Em alternativa, exporta as marcas do Region/Marker Manager e abre o CSV aqui, ou carrega em <strong>+ Marca</strong>.';
+      e.innerHTML = 'Sem marcas neste ficheiro. Só o WAV transporta <em>cues</em> embebidos — MP3, M4A e afins não os guardam. No Reaper, confirma a opção de escrever os marcadores como cues nas definições do formato WAV ao fazer render. Em alternativa, exporta as marcas do Region/Marker Manager e abre o CSV aqui, ou carrega em <strong>+ Marca</strong>.';
       list.appendChild(e);
       return;
     }
@@ -852,10 +879,21 @@
   function openFile(file){
     stopSource(); state.playing = false; syncPlayBtn();
     busy(true, 'A ler o ficheiro…');
-    var fr = new FileReader();
-    fr.onerror = function(){ busy(false); toast('Não foi possível ler o ficheiro.'); };
-    fr.onload = function(){
-      var ab = fr.result;
+    var readErr = function(e){
+      busy(false);
+      var why = e && e.message ? ' (' + e.message + ')' : '';
+      toast('Não foi possível ler o ficheiro' + why + '. Ficheiros muito grandes podem não caber na memória do telemóvel.');
+    };
+    if(file.arrayBuffer){
+      file.arrayBuffer().then(gotBytes)['catch'](readErr);
+    } else {
+      var fr = new FileReader();
+      fr.onerror = function(){ readErr(fr.error); };
+      fr.onload = function(){ gotBytes(fr.result); };
+      fr.readAsArrayBuffer(file);
+    }
+
+    function gotBytes(ab){
       var info = null;
       try{ info = readCues(ab); }catch(e){ info = null; }
       busy(true, 'A descodificar o áudio…');
@@ -907,14 +945,27 @@
           if(p && p.then) p.then(done)['catch'](fail);
         }catch(e){ fail(e); }
       };
-      // primeiro o nosso descodificador: lida com 24 bit, float e extensible,
+      if(!info){
+        // não é WAV (MP3, M4A, AIFF, FLAC…): descodifica o browser
+        browserDecode();
+        return;
+      }
+      // é WAV: o nosso descodificador trata de 24 bit, float e extensible,
       // que são precisamente os que o browser costuma recusar
-      var own = null;
-      try{ own = decodeWavPcm(ab, info); }catch(e){ own = { err: e && e.message ? e.message : 'erro interno' }; }
-      if(own && own.buffer){ done(own.buffer); }
-      else { ownErr = own && own.err; browserDecode(); }
-    };
-    fr.readAsArrayBuffer(file);
+      var label = (info.bits ? ' ' + info.bits + ' bit' : '') + (info.channels === 1 ? ' mono' : info.channels === 2 ? ' estéreo' : '');
+      busy(true, 'A descodificar' + label + '…');
+      try{
+        decodeWavPcm(ab, info,
+          function(frac){ busy(true, 'A descodificar' + label + '… ' + Math.round(frac*100) + '%'); },
+          function(err, buf){
+            if(err){ ownErr = err; browserDecode(); }
+            else done(buf);
+          });
+      }catch(e){
+        ownErr = e && e.message ? e.message : 'erro interno';
+        browserDecode();
+      }
+    }
   }
 
   function openMarkerFile(file){
